@@ -165,7 +165,7 @@ class SnapshotInstallationHandler {
         LOG.warn("{}: Failed to recognize leader for installSnapshot chunk.", getMemberId());
         return reply;
       }
-      server.changeToFollowerAndPersistMetadata(leaderTerm, "installSnapshot");
+      server.changeToFollowerAndPersistMetadata(leaderTerm, true, "installSnapshot");
       state.setLeader(leaderId, "installSnapshot");
 
       server.updateLastRpcTime(FollowerState.UpdateType.INSTALL_SNAPSHOT_START);
@@ -212,7 +212,7 @@ class SnapshotInstallationHandler {
         LOG.warn("{}: Failed to recognize leader for installSnapshot notification.", getMemberId());
         return reply;
       }
-      server.changeToFollowerAndPersistMetadata(leaderTerm, "installSnapshot");
+      server.changeToFollowerAndPersistMetadata(leaderTerm, true, "installSnapshot");
       state.setLeader(leaderId, "installSnapshot");
       server.updateLastRpcTime(FollowerState.UpdateType.INSTALL_SNAPSHOT_NOTIFICATION);
 
@@ -305,7 +305,7 @@ class SnapshotInstallationHandler {
             InstallSnapshotResult.SNAPSHOT_UNAVAILABLE);
         inProgressInstallSnapshotIndex.set(INVALID_LOG_INDEX);
         server.getStateMachine().event().notifySnapshotInstalled(
-            InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, INVALID_LOG_INDEX);
+            InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, INVALID_LOG_INDEX, server.getRaftServer().getPeer());
         return ServerProtoUtils.toInstallSnapshotReplyProto(leaderId, getMemberId(),
             currentTerm, InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, -1);
       }
@@ -323,7 +323,7 @@ class SnapshotInstallationHandler {
         inProgressInstallSnapshotIndex.set(INVALID_LOG_INDEX);
         final long latestInstalledIndex = latestInstalledSnapshotTermIndex.getIndex();
         server.getStateMachine().event().notifySnapshotInstalled(
-            InstallSnapshotResult.SNAPSHOT_INSTALLED, latestInstalledIndex);
+            InstallSnapshotResult.SNAPSHOT_INSTALLED, latestInstalledIndex, server.getRaftServer().getPeer());
         installedIndex.set(latestInstalledIndex);
         return ServerProtoUtils.toInstallSnapshotReplyProto(leaderId, getMemberId(),
             currentTerm, InstallSnapshotResult.SNAPSHOT_INSTALLED, latestInstalledSnapshotTermIndex.getIndex());
