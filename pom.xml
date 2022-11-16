@@ -83,7 +83,9 @@
 
     <module>ratis-examples</module>
     <module>ratis-replicated-map</module>
-    <module>ratis-metrics</module>
+    <module>ratis-metrics-api</module>
+    <module>ratis-metrics-default</module>
+    <module>ratis-metrics-dropwizard3</module>
     <module>ratis-tools</module>
     <module>ratis-shell</module>
     <module>ratis-assembly</module>
@@ -176,6 +178,7 @@
     <maven-stylus-skin.version>1.5</maven-stylus-skin.version>
     <maven-surefire-plugin.version>3.0.0-M1</maven-surefire-plugin.version>
     <maven-checkstyle-plugin.version>3.1.2</maven-checkstyle-plugin.version>
+    <maven-assembly-plugin.version>3.4.1</maven-assembly-plugin.version>
 
     <checkstyle.version>9.3</checkstyle.version>
 
@@ -204,21 +207,17 @@
     <maven.min.version>3.3.9</maven.min.version>
 
     <!-- Contains all shaded thirdparty dependencies -->
-    <ratis.thirdparty.version>1.0.1</ratis.thirdparty.version>
+    <ratis.thirdparty.version>1.0.3</ratis.thirdparty.version>
 
     <!-- Need these for the protobuf compiler. *MUST* match what is in ratis-thirdparty -->
-    <shaded.protobuf.version>3.19.2</shaded.protobuf.version>
-    <shaded.grpc.version>1.44.0</shaded.grpc.version>
+    <shaded.protobuf.version>3.19.6</shaded.protobuf.version>
+    <shaded.grpc.version>1.48.1</shaded.grpc.version>
 
     <!-- Test properties -->
     <maven.test.redirectTestOutputToFile>true</maven.test.redirectTestOutputToFile>
     <test.exclude.pattern>_</test.exclude.pattern>
     <!-- number of threads/forks to use when running tests in parallel, see parallel-tests profile -->
     <testsThreadCount>4</testsThreadCount>
-
-    <!--metrics-->
-    <shaded.dropwizard.version>4.2.9</shaded.dropwizard.version>
-    <shaded.dropwizard.ganglia.version>3.2.6</shaded.dropwizard.ganglia.version>
   </properties>
 
   <dependencyManagement>
@@ -274,16 +273,26 @@
         <version>${project.version}</version>
       </dependency>
       <dependency>
-       <artifactId>ratis-metrics</artifactId>
-       <groupId>org.apache.ratis</groupId>
-       <version>${project.version}</version>
+        <artifactId>ratis-metrics-api</artifactId>
+        <groupId>org.apache.ratis</groupId>
+        <version>${project.version}</version>
       </dependency>
       <dependency>
-       <artifactId>ratis-metrics</artifactId>
-       <groupId>org.apache.ratis</groupId>
-       <version>${project.version}</version>
-       <type>test-jar</type>
-       <scope>test</scope>
+        <artifactId>ratis-metrics-default</artifactId>
+        <groupId>org.apache.ratis</groupId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <artifactId>ratis-metrics-dropwizard3</artifactId>
+        <groupId>org.apache.ratis</groupId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <artifactId>ratis-metrics-default</artifactId>
+        <groupId>org.apache.ratis</groupId>
+        <version>${project.version}</version>
+        <type>test-jar</type>
+        <scope>test</scope>
       </dependency>
       <dependency>
         <artifactId>ratis-tools</artifactId>
@@ -389,6 +398,11 @@
       <dependency>
         <groupId>org.slf4j</groupId>
         <artifactId>slf4j-api</artifactId>
+        <version>1.7.29</version>
+      </dependency>
+      <dependency>
+        <groupId>org.slf4j</groupId>
+        <artifactId>slf4j-simple</artifactId>
         <version>1.7.29</version>
       </dependency>
       <dependency>
@@ -522,6 +536,7 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-assembly-plugin</artifactId>
+          <version>${maven-assembly-plugin.version}</version>
           <configuration>
             <!--Defer to the ratis-assembly sub-module.  It does all assembly-->
             <skipAssembly>true</skipAssembly>

@@ -38,6 +38,7 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 
 /**
@@ -144,7 +145,7 @@ public class SegmentedRaftLogCache {
 
   static class LogSegmentList {
     private final Object name;
-    private final List<LogSegment> segments = new ArrayList<>();
+    private final List<LogSegment> segments = new CopyOnWriteArrayList<>();
     private final AutoCloseableReadWriteLock lock;
     private long sizeInBytes;
 
@@ -165,15 +166,11 @@ public class SegmentedRaftLogCache {
     }
 
     boolean isEmpty() {
-      try(AutoCloseableLock readLock = readLock()) {
-        return segments.isEmpty();
-      }
+      return segments.isEmpty();
     }
 
     int size() {
-      try(AutoCloseableLock readLock = readLock()) {
-        return segments.size();
-      }
+      return segments.size();
     }
 
     long getTotalFileSize() {
@@ -181,20 +178,11 @@ public class SegmentedRaftLogCache {
     }
 
     long getTotalCacheSize() {
-      try(AutoCloseableLock readLock = readLock()) {
-        long size = 0;
-        // TODO(runzhiwang): If there is performance problem, start a daemon thread to checkAndEvictCache.
-        for (LogSegment seg : segments) {
-          size += seg.getTotalCacheSize();
-        }
-        return size;
-      }
+      return segments.stream().mapToLong(LogSegment::getTotalCacheSize).sum();
     }
 
     long countCached() {
-      try(AutoCloseableLock readLock = readLock()) {
-        return segments.stream().filter(LogSegment::hasCache).count();
-      }
+      return segments.stream().filter(LogSegment::hasCache).count();
     }
 
     LogSegment getLast() {
@@ -204,9 +192,7 @@ public class SegmentedRaftLogCache {
     }
 
     LogSegment get(int i) {
-      try(AutoCloseableLock readLock = readLock()) {
-        return segments.get(i);
-      }
+      return segments.get(i);
     }
 
     int binarySearch(long index) {
@@ -353,6 +339,11 @@ public class SegmentedRaftLogCache {
       clearOpenSegment.run();
       return info;
     }
+
+    @Override
+    public String toString() {
+      return name + ":" + segments;
+    }
   }
 
   private final String name;
@@ -371,9 +362,9 @@ public class SegmentedRaftLogCache {
     this.closedSegments = new LogSegmentList(name);
     this.storage = storage;
     this.raftLogMetrics = raftLogMetrics;
-    this.raftLogMetrics.addClosedSegmentsNum(this);
-    this.raftLogMetrics.addClosedSegmentsSizeInBytes(this);
-    this.raftLogMetrics.addOpenSegmentSizeInBytes(this);
+    this.raftLogMetrics.addClosedSegmentsNum(this::getCachedSegmentNum);
+    this.raftLogMetrics.addClosedSegmentsSizeInBytes(this::getClosedSegmentsSizeInBytes);
+    this.raftLogMetrics.addOpenSegmentSizeInBytes(this::getOpenSegmentSizeInBytes);
     this.maxCachedSegments = RaftServerConfigKeys.Log.segmentCacheNumMax(properties);
     this.maxSegmentCacheSize = RaftServerConfigKeys.Log.segmentCacheSizeMax(properties).getSize();
   }
@@ -391,19 +382,19 @@ public class SegmentedRaftLogCache {
     }
   }
 
-  public long getCachedSegmentNum() {
+  long getCachedSegmentNum() {
     return closedSegments.countCached();
   }
 
-  public long getClosedSegmentsSizeInBytes() {
+  long getClosedSegmentsSizeInBytes() {
     return closedSegments.getTotalFileSize();
   }
 
-  public long getOpenSegmentSizeInBytes() {
+  long getOpenSegmentSizeInBytes() {
     return openSegment == null ? 0 : openSegment.getTotalFileSize();
   }
 
-  public long getTotalCacheSize() {
+  private long getTotalCacheSize() {
     return closedSegments.getTotalCacheSize() +
             Optional.ofNullable(openSegment).map(LogSegment::getTotalCacheSize).orElse(0L);
   }
@@ -595,25 +586,26 @@ public class SegmentedRaftLogCache {
     }
   }
 
-  TruncateIndices computeTruncateIndices(Consumer<TermIndex> failClientRequest, LogEntryProto... entries) {
+  TruncateIndices computeTruncateIndices(Consumer<TermIndex> failClientRequest, List<LogEntryProto> entries) {
     int arrayIndex = 0;
     long truncateIndex = -1;
 
     try(AutoCloseableLock readLock = closedSegments.readLock()) {
-      final Iterator<TermIndex> i = iterator(entries[0].getIndex());
-      for(; i.hasNext() && arrayIndex < entries.length; arrayIndex++) {
+      final Iterator<TermIndex> i = iterator(entries.get(0).getIndex());
+      for(; i.hasNext() && arrayIndex < entries.size(); arrayIndex++) {
         final TermIndex storedEntry = i.next();
-        Preconditions.assertTrue(storedEntry.getIndex() == entries[arrayIndex].getIndex(),
+        LogEntryProto logEntryProto = entries.get(arrayIndex);
+        Preconditions.assertTrue(storedEntry.getIndex() == logEntryProto.getIndex(),
             "The stored entry's index %s is not consistent with the received entries[%s]'s index %s",
-            storedEntry.getIndex(), arrayIndex, entries[arrayIndex].getIndex());
+            storedEntry.getIndex(), arrayIndex, logEntryProto.getIndex());
 
-        if (storedEntry.getTerm() != entries[arrayIndex].getTerm()) {
+        if (storedEntry.getTerm() != logEntryProto.getTerm()) {
           // we should truncate from the storedEntry's arrayIndex
           truncateIndex = storedEntry.getIndex();
           if (LOG.isTraceEnabled()) {
             LOG.trace("{}: truncate to {}, arrayIndex={}, ti={}, storedEntry={}, entries={}",
                 name, truncateIndex, arrayIndex,
-                TermIndex.valueOf(entries[arrayIndex]), storedEntry,
+                TermIndex.valueOf(logEntryProto), storedEntry,
                 LogProtoUtils.toLogEntriesString(entries));
           }
 

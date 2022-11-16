@@ -20,6 +20,7 @@ package org.apache.ratis.server.raftlog.segmented;
 import org.apache.ratis.BaseTest;
 import org.apache.ratis.RaftTestUtil.SimpleOperation;
 import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.metrics.impl.DefaultTimekeeperImpl;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.impl.RaftServerTestUtil;
 import org.apache.ratis.server.metrics.SegmentedRaftLogMetrics;
@@ -51,8 +52,6 @@ import java.util.concurrent.ThreadLocalRandom;
 
 import static org.apache.ratis.server.raftlog.RaftLog.INVALID_LOG_INDEX;
 import static org.apache.ratis.server.raftlog.segmented.LogSegment.getEntrySize;
-
-import org.apache.ratis.thirdparty.com.codahale.metrics.Timer;
 
 /**
  * Test basic functionality of {@link LogSegment}
@@ -98,6 +97,7 @@ public class TestLogSegment extends BaseTest {
         SimpleOperation op = new SimpleOperation("m" + i);
         entries[i] = LogProtoUtils.toLogEntryProto(op.getLogEntryContent(), term, i + startIndex);
         out.write(entries[i]);
+        LOG.info("Write entry with size {}", size(entries[i]));
       }
     }
 
@@ -218,10 +218,10 @@ public class TestLogSegment extends BaseTest {
     checkLogSegment(openSegment, 0, 98, true, openSegmentFile.length(), 0);
     storage.close();
 
-    Timer readEntryTimer = raftLogMetrics.getRaftLogReadEntryTimer();
+    final DefaultTimekeeperImpl readEntryTimer = (DefaultTimekeeperImpl) raftLogMetrics.getReadEntryTimer();
     Assert.assertNotNull(readEntryTimer);
-    Assert.assertEquals(100, readEntryTimer.getCount());
-    Assert.assertTrue(readEntryTimer.getMeanRate() > 0);
+    Assert.assertEquals(100, readEntryTimer.getTimer().getCount());
+    Assert.assertTrue(readEntryTimer.getTimer().getMeanRate() > 0);
   }
 
 
@@ -293,7 +293,8 @@ public class TestLogSegment extends BaseTest {
     // make sure preallocation is correct with different max/pre-allocated size
     for (int max : maxSizes) {
       for (int a : preallocated) {
-        try(SegmentedRaftLogOutputStream ignored = new SegmentedRaftLogOutputStream(file, false, max, a, ByteBuffer.allocateDirect(bufferSize))) {
+        try(SegmentedRaftLogOutputStream ignored =
+                new SegmentedRaftLogOutputStream(file, false, max, a, ByteBuffer.allocateDirect(bufferSize))) {
           Assert.assertEquals("max=" + max + ", a=" + a, file.length(), Math.min(max, a));
         }
         try(SegmentedRaftLogInputStream in = new SegmentedRaftLogInputStream(file, 0, INVALID_LOG_INDEX, true)) {

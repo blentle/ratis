@@ -102,6 +102,7 @@ public class GrpcServerProtocolClient implements Closeable {
     } else {
       channelBuilder.negotiationType(NegotiationType.PLAINTEXT);
     }
+    channelBuilder.disableRetry();
     return channelBuilder.flowControlWindow(flowControlWindow).build();
   }
 
@@ -128,6 +129,11 @@ public class GrpcServerProtocolClient implements Closeable {
         blockingStub.withDeadlineAfter(requestTimeoutDuration.getDuration(), requestTimeoutDuration.getUnit())
             .startLeaderElection(request);
     return r;
+  }
+
+  void readIndex(ReadIndexRequestProto request, StreamObserver<ReadIndexReplyProto> s) {
+    asyncStub.withDeadlineAfter(requestTimeoutDuration.getDuration(), requestTimeoutDuration.getUnit())
+        .readIndex(request, s);
   }
 
   StreamObserver<AppendEntriesRequestProto> appendEntries(

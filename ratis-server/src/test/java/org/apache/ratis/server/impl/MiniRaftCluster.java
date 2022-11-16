@@ -40,6 +40,7 @@ import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.ServerFactory;
 import org.apache.ratis.server.raftlog.memory.MemoryRaftLog;
 import org.apache.ratis.server.raftlog.RaftLog;
+import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachine;
 import org.apache.ratis.statemachine.impl.BaseStateMachine;
 import org.apache.ratis.util.CollectionUtils;
@@ -73,6 +74,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -89,6 +91,7 @@ public abstract class MiniRaftCluster implements Closeable {
   private static final StateMachine.Registry STATEMACHINE_REGISTRY_DEFAULT = gid -> new BaseStateMachine();
   private static final TimeDuration RETRY_INTERVAL_DEFAULT =
       TimeDuration.valueOf(100, TimeUnit.MILLISECONDS);
+  static final AtomicInteger THREAD_COUNT = new AtomicInteger(0);
 
   public static abstract class Factory<CLUSTER extends MiniRaftCluster> {
     public interface Get<CLUSTER extends MiniRaftCluster> {
@@ -385,8 +388,9 @@ public abstract class MiniRaftCluster implements Closeable {
       }
       final RaftProperties prop = new RaftProperties(properties);
       RaftServerConfigKeys.setStorageDir(prop, Collections.singletonList(dir));
-      return ServerImplUtils.newRaftServer(id, group, getStateMachineRegistry(prop), prop,
-          setPropertiesAndInitParameters(id, group, prop));
+      return ServerImplUtils.newRaftServer(id, group,
+          format? RaftStorage.StartupOption.FORMAT: RaftStorage.StartupOption.RECOVER,
+          getStateMachineRegistry(prop), null, prop, setPropertiesAndInitParameters(id, group, prop));
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
@@ -656,6 +660,12 @@ public abstract class MiniRaftCluster implements Closeable {
         .collect(Collectors.toList());
   }
 
+  public List<RaftServer.Division> getListeners() {
+    return getServerAliveStream()
+        .filter(server -> server.getInfo().isListener())
+        .collect(Collectors.toList());
+  }
+
   public int getNumServers() {
     return servers.size();
   }
@@ -828,7 +838,8 @@ public abstract class MiniRaftCluster implements Closeable {
     // TODO: classes like RaftLog may throw uncaught exception during shutdown (e.g. write after close)
     ExitUtils.setTerminateOnUncaughtException(false);
 
-    final ExecutorService executor = Executors.newFixedThreadPool(servers.size(), Daemon::new);
+    final ExecutorService executor = Executors.newFixedThreadPool(servers.size(), (t) ->
+        Daemon.newBuilder().setName("MiniRaftCluster-" + THREAD_COUNT.incrementAndGet()).setRunnable(t).build());
     getServers().forEach(proxy -> executor.submit(() -> JavaUtils.runAsUnchecked(proxy::close)));
     try {
       executor.shutdown();

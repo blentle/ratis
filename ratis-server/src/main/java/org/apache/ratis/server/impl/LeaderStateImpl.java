@@ -18,6 +18,7 @@
 package org.apache.ratis.server.impl;
 
 import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.proto.RaftProtos.AppendEntriesRequestProto;
 import org.apache.ratis.proto.RaftProtos.CommitInfoProto;
 import org.apache.ratis.proto.RaftProtos.LogEntryProto;
@@ -37,8 +38,10 @@ import org.apache.ratis.protocol.TransferLeadershipRequest;
 import org.apache.ratis.protocol.exceptions.LeaderNotReadyException;
 import org.apache.ratis.protocol.exceptions.NotLeaderException;
 import org.apache.ratis.protocol.exceptions.NotReplicatedException;
+import org.apache.ratis.protocol.exceptions.ReadIndexException;
 import org.apache.ratis.protocol.exceptions.ReconfigurationTimeoutException;
 import org.apache.ratis.server.RaftServerConfigKeys;
+import org.apache.ratis.server.impl.ReadIndexHeartbeats.AppendEntriesListener;
 import org.apache.ratis.server.leader.FollowerInfo;
 import org.apache.ratis.server.leader.LeaderState;
 import org.apache.ratis.server.leader.LogAppender;
@@ -53,6 +56,7 @@ import org.apache.ratis.util.CodeInjectionForTesting;
 import org.apache.ratis.util.CollectionUtils;
 import org.apache.ratis.util.Daemon;
 import org.apache.ratis.util.JavaUtils;
+import org.apache.ratis.util.MemoizedSupplier;
 import org.apache.ratis.util.Preconditions;
 import org.apache.ratis.util.TimeDuration;
 import org.apache.ratis.util.Timestamp;
@@ -257,6 +261,8 @@ class LeaderStateImpl implements LeaderState {
   private final long followerMaxGapThreshold;
   private final PendingStepDown pendingStepDown;
 
+  private final ReadIndexHeartbeats readIndexHeartbeats;
+
   LeaderStateImpl(RaftServerImpl server) {
     this.name = server.getMemberId() + "-" + JavaUtils.getClassSimpleName(getClass());
     this.server = server;
@@ -269,13 +275,14 @@ class LeaderStateImpl implements LeaderState {
     this.currentTerm = state.getCurrentTerm();
 
     this.eventQueue = new EventQueue();
-    processor = new EventProcessor(this.name);
+    processor = new EventProcessor(this.name, server);
     raftServerMetrics = server.getRaftServerMetrics();
     logAppenderMetrics = new LogAppenderMetrics(server.getMemberId());
     this.pendingRequests = new PendingRequests(server.getMemberId(), properties, raftServerMetrics);
     this.watchRequests = new WatchRequests(server.getMemberId(), properties);
     this.messageStreamRequests = new MessageStreamRequests(server.getMemberId());
     this.pendingStepDown = new PendingStepDown(this);
+    this.readIndexHeartbeats = new ReadIndexHeartbeats();
     long maxPendingRequests = RaftServerConfigKeys.Write.elementLimit(properties);
     double followerGapRatioMax = RaftServerConfigKeys.Write.followerGapRatioMax(properties);
 
@@ -310,7 +317,7 @@ class LeaderStateImpl implements LeaderState {
         server.getRaftConf(), server.getState().getCurrentTerm(), raftLog.getNextIndex());
     CodeInjectionForTesting.execute(APPEND_PLACEHOLDER,
         server.getId().toString(), null);
-    raftLog.append(placeHolder);
+    raftLog.append(Collections.singletonList(placeHolder));
     processor.start();
     senders.forEach(LogAppender::start);
     return placeHolder;
@@ -334,6 +341,8 @@ class LeaderStateImpl implements LeaderState {
       LOG.warn("{}: Caught exception in sendNotLeaderResponses", this, e);
     }
     messageStreamRequests.clear();
+    // TODO client should retry on NotLeaderException
+    readIndexHeartbeats.failListeners(nle);
     server.getServerRpc().notifyNotLeader(server.getMemberId().getGroupId());
     logAppenderMetrics.unregister();
     raftServerMetrics.unregister();
@@ -617,8 +626,9 @@ class LeaderStateImpl implements LeaderState {
    * state, such as changing to follower, or updating the committed index.
    */
   private class EventProcessor extends Daemon {
-    public EventProcessor(String name) {
-      setName(name);
+    public EventProcessor(String name, RaftServerImpl server) {
+      super(Daemon.newBuilder()
+          .setName(name).setThreadGroup(server.getThreadGroup()));
     }
     @Override
     public void run() {
@@ -801,6 +811,39 @@ class LeaderStateImpl implements LeaderState {
       final MinMajorityMax oldConf = MinMajorityMax.valueOf(indicesInOldConf, followerMaxGapThreshold);
       return Optional.of(newConf.combine(oldConf));
     }
+  }
+
+  private boolean hasMajority(Predicate<RaftPeerId> isAcked) {
+    final RaftPeerId selfId = server.getId();
+    final RaftConfigurationImpl conf = server.getRaftConf();
+
+    final List<RaftPeerId> followers = voterLists.get(0);
+    final boolean includeSelf = conf.containsInConf(selfId);
+    final boolean newConf = hasMajority(isAcked, followers, includeSelf);
+
+    if (!conf.isTransitional()) {
+      return newConf;
+    } else {
+      final List<RaftPeerId> oldFollowers = voterLists.get(1);
+      final boolean includeSelfInOldConf = conf.containsInOldConf(selfId);
+      final boolean oldConf = hasMajority(isAcked, oldFollowers, includeSelfInOldConf);
+      return newConf && oldConf;
+    }
+  }
+
+  private boolean hasMajority(Predicate<RaftPeerId> isAcked, List<RaftPeerId> followers, boolean includeSelf) {
+    if (followers.isEmpty() && !includeSelf) {
+      return true;
+    }
+
+    int count = includeSelf ? 1 : 0;
+    for (RaftPeerId follower: followers) {
+      if (isAcked.test(follower)) {
+        count++;
+      }
+    }
+    final int size = includeSelf ? followers.size() + 1 : followers.size();
+    return count > size / 2;
   }
 
   private void updateCommit(LogEntryHeader[] entriesToCommit) {
@@ -1026,6 +1069,57 @@ class LeaderStateImpl implements LeaderState {
     // step down as follower
     stepDown(currentTerm, StepDownReason.LOST_MAJORITY_HEARTBEATS);
     return false;
+  }
+
+  /**
+   * Obtain the current readIndex for read only requests. See Raft paper section 6.4.
+   * 1. Leader makes sure at least one log from current term is committed.
+   * 2. Leader record last committed index as readIndex.
+   * 3. Leader broadcast heartbeats to followers and waits for acknowledgements.
+   * 4. If majority respond success, returns readIndex.
+   * @return current readIndex.
+   */
+  CompletableFuture<Long> getReadIndex() {
+    final long readIndex = server.getRaftLog().getLastCommittedIndex();
+
+    // if group contains only one member, fast path
+    if (server.getRaftConf().getCurrentPeers().size() == 1) {
+      return CompletableFuture.completedFuture(readIndex);
+    }
+
+    // leader has not committed any entries in this term, reject
+    if (server.getRaftLog().getTermIndex(readIndex).getTerm() != server.getState().getCurrentTerm()) {
+      return JavaUtils.completeExceptionally(new ReadIndexException(
+          "Failed to getReadIndex " + readIndex + " since the term is not yet committed.",
+          new LeaderNotReadyException(server.getMemberId())));
+    }
+
+    final MemoizedSupplier<AppendEntriesListener> supplier = MemoizedSupplier.valueOf(
+        () -> new AppendEntriesListener(readIndex));
+    final AppendEntriesListener listener = readIndexHeartbeats.addAppendEntriesListener(
+        readIndex, key -> supplier.get());
+
+    // the readIndex is already acknowledged before
+    if (listener == null) {
+      return CompletableFuture.completedFuture(readIndex);
+    }
+
+    if (supplier.isInitialized()) {
+      senders.forEach(sender -> {
+        try {
+          sender.triggerHeartbeat();
+        } catch (IOException e) {
+          LOG.warn("{}: {} cannot trigger heartbeat due to {}", this, sender, e);
+        }
+      });
+    }
+
+    return listener.getFuture();
+  }
+
+  @Override
+  public void onAppendEntriesReply(LogAppender appender, RaftProtos.AppendEntriesReplyProto reply) {
+    readIndexHeartbeats.onAppendEntriesReply(appender, reply, this::hasMajority);
   }
 
   void replyPendingRequest(long logIndex, RaftClientReply reply) {

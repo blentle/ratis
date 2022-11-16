@@ -17,6 +17,7 @@
  */
 package org.apache.ratis.server.impl;
 
+import org.apache.ratis.metrics.Timekeeper;
 import org.apache.ratis.proto.RaftProtos.RequestVoteReplyProto;
 import org.apache.ratis.proto.RaftProtos.RequestVoteRequestProto;
 import org.apache.ratis.protocol.RaftPeer;
@@ -58,20 +59,18 @@ import static org.apache.ratis.util.LifeCycle.State.NEW;
 import static org.apache.ratis.util.LifeCycle.State.RUNNING;
 import static org.apache.ratis.util.LifeCycle.State.STARTING;
 
-import org.apache.ratis.thirdparty.com.codahale.metrics.Timer;
-
 /**
  * For a candidate to start an election for becoming the leader.
  * There are two phases: Pre-Vote and Election.
- *
+ * <p>
  * In Pre-Vote, the candidate does not change its term and try to learn
  * if a majority of the cluster would be willing to grant the candidate their votes
  * (if the candidate’s log is sufficiently up-to-date,
  * and the voters have not received heartbeats from a valid leader
  * for at least a baseline election timeout).
- *
+ * <p>
  * Once the Pre-Vote has passed, the candidate increments its term and starts a real Election.
- *
+ * <p>
  * See
  * Ongaro, D. Consensus: Bridging Theory and Practice. PhD thesis, Stanford University, 2014.
  * Available at https://github.com/ongardie/dissertation
@@ -138,7 +137,8 @@ class LeaderElection implements Runnable {
 
     Executor(Object name, int size) {
       Preconditions.assertTrue(size > 0);
-      executor = Executors.newFixedThreadPool(size, r -> new Daemon(r, name + "-" + count.incrementAndGet()));
+      executor = Executors.newFixedThreadPool(size, r ->
+          Daemon.newBuilder().setName(name + "-" + count.incrementAndGet()).setRunnable(r).build());
       service = new ExecutorCompletionService<>(executor);
     }
 
@@ -190,7 +190,8 @@ class LeaderElection implements Runnable {
   LeaderElection(RaftServerImpl server, boolean skipPreVote) {
     this.name = server.getMemberId() + "-" + JavaUtils.getClassSimpleName(getClass()) + COUNT.incrementAndGet();
     this.lifeCycle = new LifeCycle(this);
-    this.daemon = new Daemon(this);
+    this.daemon = Daemon.newBuilder().setName(name).setRunnable(this)
+        .setThreadGroup(server.getThreadGroup()).build();
     this.server = server;
     this.skipPreVote = skipPreVote ||
         !RaftServerConfigKeys.LeaderElection.preVote(
@@ -232,8 +233,7 @@ class LeaderElection implements Runnable {
       return;
     }
 
-    final Timer.Context electionContext = server.getLeaderElectionMetrics().getLeaderElectionTimer().time();
-    try {
+    try (AutoCloseable ignored = Timekeeper.start(server.getLeaderElectionMetrics().getLeaderElectionTimer())) {
       if (skipPreVote || askForVotes(Phase.PRE_VOTE)) {
         if (askForVotes(Phase.ELECTION)) {
           server.changeToLeader();
@@ -255,7 +255,6 @@ class LeaderElection implements Runnable {
       }
     } finally {
       // Update leader election completion metric(s).
-      electionContext.stop();
       server.getLeaderElectionMetrics().onNewLeaderElectionCompletion();
       lifeCycle.checkStateAndClose(() -> {});
     }

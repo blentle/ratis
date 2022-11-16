@@ -35,7 +35,7 @@ import org.apache.ratis.server.raftlog.segmented.SegmentedRaftLogCache.LogSegmen
 import org.apache.ratis.server.raftlog.segmented.TestSegmentedRaftLog.SegmentRange;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.server.storage.RaftStorageTestUtils;
-import org.apache.ratis.statemachine.SimpleStateMachine4Testing;
+import org.apache.ratis.statemachine.impl.SimpleStateMachine4Testing;
 import org.apache.ratis.statemachine.StateMachine;
 import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.SizeInBytes;
@@ -171,7 +171,7 @@ public class TestCacheEviction extends BaseTest {
     final SegmentedRaftLog raftLog = RaftServerTestUtil.newSegmentedRaftLog(memberId, info, storage, prop);
     raftLog.open(RaftLog.INVALID_LOG_INDEX, null);
     List<SegmentRange> slist = TestSegmentedRaftLog.prepareRanges(0, maxCachedNum, 7, 0);
-    LogEntryProto[] entries = generateEntries(slist);
+    List<LogEntryProto> entries = generateEntries(slist);
     raftLog.append(entries).forEach(CompletableFuture::join);
 
     // check the current cached segment number: the last segment is still open
@@ -190,7 +190,7 @@ public class TestCacheEviction extends BaseTest {
         raftLog.getRaftLogCache().getCachedSegmentNum());
   }
 
-  private LogEntryProto[] generateEntries(List<SegmentRange> slist) {
+  private List<LogEntryProto> generateEntries(List<SegmentRange> slist) {
     List<LogEntryProto> eList = new ArrayList<>();
     for (SegmentRange range : slist) {
       for (long index = range.start; index <= range.end; index++) {
@@ -198,6 +198,6 @@ public class TestCacheEviction extends BaseTest {
         eList.add(LogProtoUtils.toLogEntryProto(m.getLogEntryContent(), range.term, index));
       }
     }
-    return eList.toArray(new LogEntryProto[eList.size()]);
+    return eList;
   }
 }

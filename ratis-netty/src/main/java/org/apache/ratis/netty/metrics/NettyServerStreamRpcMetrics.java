@@ -17,12 +17,16 @@
  */
 package org.apache.ratis.netty.metrics;
 
-import org.apache.ratis.thirdparty.com.codahale.metrics.Timer;
+import org.apache.ratis.metrics.LongCounter;
 import org.apache.ratis.metrics.MetricRegistryInfo;
 import org.apache.ratis.metrics.RatisMetricRegistry;
 import org.apache.ratis.metrics.RatisMetrics;
+import org.apache.ratis.metrics.Timekeeper;
 
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Function;
 
 public class NettyServerStreamRpcMetrics extends RatisMetrics {
   private static final String METRICS_APP_NAME = "ratis_netty";
@@ -64,34 +68,22 @@ public class NettyServerStreamRpcMetrics extends RatisMetrics {
     }
   }
 
-  public static final class RequestContext {
-    private final Timer.Context timerContext;
-
-    private RequestContext(Timer.Context timerContext) {
-      this.timerContext = timerContext;
-    }
-
-    Timer.Context getTimerContext() {
-      return timerContext;
-    }
-  }
-
   public final class RequestMetrics {
     private final RequestType type;
-    private final Timer timer;
+    private final Timekeeper timer;
 
     private RequestMetrics(RequestType type) {
       this.type = type;
       this.timer = getLatencyTimer(type);
     }
 
-    public RequestContext start() {
+    public Timekeeper.Context start() {
       onRequestCreate(type);
-      return new RequestContext(timer.time());
+      return timer.time();
     }
 
-    public void stop(RequestContext context, boolean success) {
-      context.getTimerContext().stop();
+    public void stop(Timekeeper.Context context, boolean success) {
+      context.stop();
       if (success) {
         onRequestSuccess(type);
       } else {
@@ -100,11 +92,32 @@ public class NettyServerStreamRpcMetrics extends RatisMetrics {
     }
   }
 
-  public NettyServerStreamRpcMetrics(String serverId) {
-    registry = getMetricRegistryForGrpcServer(serverId);
+  private enum Op {
+    Create(RequestType::getNumRequestsString),
+    Success(RequestType::getSuccessCountString),
+    Fail(RequestType::getFailCountString);
+
+    private final Function<RequestType, String> stringFunction;
+
+    Op(Function<RequestType, String> stringFunction) {
+      this.stringFunction = stringFunction;
+    }
+
+    String getString(RequestType type) {
+      return stringFunction.apply(type);
+    }
   }
 
-  private RatisMetricRegistry getMetricRegistryForGrpcServer(String serverId) {
+  private final Map<String, Timekeeper> latencyTimers = new ConcurrentHashMap<>();
+  private final Map<Op, Map<String, LongCounter>> ops;
+
+  public NettyServerStreamRpcMetrics(String serverId) {
+    super(createRegistry(serverId));
+
+    this.ops = newCounterMaps(Op.class);
+  }
+
+  private static RatisMetricRegistry createRegistry(String serverId) {
     return create(new MetricRegistryInfo(serverId,
         METRICS_APP_NAME, METRICS_COMP_NAME, METRICS_DESC));
   }
@@ -113,19 +126,23 @@ public class NettyServerStreamRpcMetrics extends RatisMetrics {
     return new RequestMetrics(type);
   }
 
-  public Timer getLatencyTimer(RequestType type) {
-    return registry.timer(type.getLatencyString());
+  public Timekeeper getLatencyTimer(RequestType type) {
+    return latencyTimers.computeIfAbsent(type.getLatencyString(), getRegistry()::timer);
+  }
+
+  private void inc(Op op, RequestType type) {
+    ops.get(op).computeIfAbsent(op.getString(type), getRegistry()::counter).inc();
   }
 
   public void onRequestCreate(RequestType type) {
-    registry.counter(type.getNumRequestsString()).inc();
+    inc(Op.Create, type);
   }
 
   public void onRequestSuccess(RequestType type) {
-    registry.counter(type.getSuccessCountString()).inc();
+    inc(Op.Success, type);
   }
 
   public void onRequestFail(RequestType type) {
-    registry.counter(type.getFailCountString()).inc();
+    inc(Op.Fail, type);
   }
 }

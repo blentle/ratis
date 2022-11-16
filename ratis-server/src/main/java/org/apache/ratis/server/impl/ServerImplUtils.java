@@ -26,6 +26,7 @@ import org.apache.ratis.server.RaftConfiguration;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.raftlog.RaftLog;
+import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.statemachine.StateMachine;
 import org.apache.ratis.util.IOUtils;
 import org.apache.ratis.util.JavaUtils;
@@ -45,27 +46,27 @@ public final class ServerImplUtils {
 
   /** Create a {@link RaftServerProxy}. */
   public static RaftServerProxy newRaftServer(
-      RaftPeerId id, RaftGroup group, StateMachine.Registry stateMachineRegistry,
-      RaftProperties properties, Parameters parameters) throws IOException {
+      RaftPeerId id, RaftGroup group, RaftStorage.StartupOption option, StateMachine.Registry stateMachineRegistry,
+      ThreadGroup threadGroup, RaftProperties properties, Parameters parameters) throws IOException {
     RaftServer.LOG.debug("newRaftServer: {}, {}", id, group);
     if (group != null && !group.getPeers().isEmpty()) {
       Preconditions.assertNotNull(id, "RaftPeerId %s is not in RaftGroup %s", id, group);
       Preconditions.assertNotNull(group.getPeer(id), "RaftPeerId %s is not in RaftGroup %s", id, group);
     }
-    final RaftServerProxy proxy = newRaftServer(id, stateMachineRegistry, properties, parameters);
-    proxy.initGroups(group);
+    final RaftServerProxy proxy = newRaftServer(id, stateMachineRegistry, threadGroup, properties, parameters);
+    proxy.initGroups(group, option);
     return proxy;
   }
 
   private static RaftServerProxy newRaftServer(
-      RaftPeerId id, StateMachine.Registry stateMachineRegistry, RaftProperties properties, Parameters parameters)
-      throws IOException {
+      RaftPeerId id, StateMachine.Registry stateMachineRegistry, ThreadGroup threadGroup, RaftProperties properties,
+      Parameters parameters) throws IOException {
     final TimeDuration sleepTime = TimeDuration.valueOf(500, TimeUnit.MILLISECONDS);
     final RaftServerProxy proxy;
     try {
       // attempt multiple times to avoid temporary bind exception
       proxy = JavaUtils.attemptRepeatedly(
-          () -> new RaftServerProxy(id, stateMachineRegistry, properties, parameters),
+          () -> new RaftServerProxy(id, stateMachineRegistry, properties, parameters, threadGroup),
           5, sleepTime, "new RaftServerProxy", RaftServer.LOG);
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();

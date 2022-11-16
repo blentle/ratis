@@ -23,7 +23,7 @@
   -->
   <id>bin</id>
   <formats>
-    <format>tar.gz</format>
+    <format>dir</format>
   </formats>
   <moduleSets>
     <moduleSet>
@@ -39,7 +39,9 @@
         <include>org.apache.ratis:ratis-server-api</include>
         <include>org.apache.ratis:ratis-server</include>
         <include>org.apache.ratis:ratis-test</include>
-        <include>org.apache.ratis:ratis-metrics</include>
+        <include>org.apache.ratis:ratis-metrics-api</include>
+        <include>org.apache.ratis:ratis-metrics-default</include>
+        <include>org.apache.ratis:ratis-metrics-dropwizard3</include>
         <include>org.apache.ratis:ratis-tools</include>
         <include>org.apache.ratis:ratis-resource-bundle</include>
       </includes>
@@ -51,14 +53,6 @@
     </moduleSet>
   </moduleSets>
   <fileSets>
-    <fileSet>
-      <directory>${project.basedir}/..</directory>
-      <outputDirectory>.</outputDirectory>
-      <includes>
-        <include>DISCLAIMER</include>
-      </includes>
-      <fileMode>0644</fileMode>
-    </fileSet>
     <fileSet>
       <directory>${project.basedir}/src/main/resources</directory>
       <outputDirectory>.</outputDirectory>
@@ -75,37 +69,6 @@
       <outputDirectory>docs</outputDirectory>
       <fileMode>0644</fileMode>
       <directoryMode>0755</directoryMode>
-    </fileSet>
-    <!-- Include dev support tools -->
-    <fileSet>
-      <directory>${project.basedir}/../dev-support</directory>
-      <outputDirectory>dev-support</outputDirectory>
-      <fileMode>0644</fileMode>
-      <directoryMode>0755</directoryMode>
-    </fileSet>
-    <fileSet>
-      <directory>${project.basedir}/../ratis-shell/target/</directory>
-      <outputDirectory>ratis-shell/lib/shell</outputDirectory>
-      <fileMode>755</fileMode>
-      <includes>
-        <include>ratis-shell-*-jar-with-dependencies.jar</include>
-      </includes>
-    </fileSet>
-    <fileSet>
-      <directory>${project.basedir}/../ratis-shell/src/main/bin</directory>
-      <outputDirectory>ratis-shell/bin</outputDirectory>
-      <fileMode>755</fileMode>
-    </fileSet>
-    <fileSet>
-      <directory>${project.basedir}/../ratis-shell/src/main/libexec</directory>
-      <outputDirectory>ratis-shell/libexec</outputDirectory>
-      <fileMode>0644</fileMode>
-      <directoryMode>0755</directoryMode>
-    </fileSet>
-    <fileSet>
-      <directory>${project.basedir}/../ratis-shell/src/main/conf</directory>
-      <outputDirectory>ratis-shell/conf</outputDirectory>
-      <fileMode>644</fileMode>
     </fileSet>
   </fileSets>
 </assembly>

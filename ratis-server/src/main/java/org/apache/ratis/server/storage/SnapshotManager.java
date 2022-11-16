@@ -17,6 +17,25 @@
  */
 package org.apache.ratis.server.storage;
 
+import org.apache.ratis.io.CorruptedFileException;
+import org.apache.ratis.io.MD5Hash;
+import org.apache.ratis.proto.RaftProtos.FileChunkProto;
+import org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto;
+import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.server.util.ServerStringUtils;
+import org.apache.ratis.statemachine.SnapshotInfo;
+import org.apache.ratis.statemachine.StateMachine;
+import org.apache.ratis.statemachine.StateMachineStorage;
+import org.apache.ratis.util.FileUtils;
+import org.apache.ratis.util.IOUtils;
+import org.apache.ratis.util.JavaUtils;
+import org.apache.ratis.util.MD5FileUtil;
+import org.apache.ratis.util.MemoizedSupplier;
+import org.apache.ratis.util.Preconditions;
+import org.apache.ratis.util.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -24,23 +43,9 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.security.DigestOutputStream;
 import java.security.MessageDigest;
+import java.util.Optional;
+import java.util.function.Function;
 import java.util.function.Supplier;
-
-import org.apache.ratis.io.CorruptedFileException;
-import org.apache.ratis.io.MD5Hash;
-import org.apache.ratis.protocol.RaftPeerId;
-import org.apache.ratis.proto.RaftProtos.FileChunkProto;
-import org.apache.ratis.proto.RaftProtos.InstallSnapshotRequestProto;
-import org.apache.ratis.statemachine.SnapshotInfo;
-import org.apache.ratis.statemachine.StateMachine;
-import org.apache.ratis.util.FileUtils;
-import org.apache.ratis.util.IOUtils;
-import org.apache.ratis.util.JavaUtils;
-import org.apache.ratis.util.MD5FileUtil;
-import org.apache.ratis.util.Preconditions;
-import org.apache.ratis.util.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * Manage snapshots of a raft peer.
@@ -53,33 +58,41 @@ public class SnapshotManager {
   private static final String CORRUPT = ".corrupt";
   private static final String TMP = ".tmp";
 
-  private final RaftStorage storage;
   private final RaftPeerId selfId;
+
+  private final Supplier<File> snapshotDir;
+  private final Supplier<File> tmp;
+  private final Function<FileChunkProto, String> getRelativePath;
   private final Supplier<MessageDigest> digester = JavaUtils.memoize(MD5Hash::getDigester);
 
-  public SnapshotManager(RaftStorage storage, RaftPeerId selfId) {
-    this.storage = storage;
+  SnapshotManager(RaftPeerId selfId, Supplier<RaftStorageDirectory> dir, StateMachineStorage smStorage) {
     this.selfId = selfId;
+    this.snapshotDir = MemoizedSupplier.valueOf(
+        () -> Optional.ofNullable(smStorage.getSnapshotDir()).orElseGet(() -> dir.get().getStateMachineDir()));
+    this.tmp = MemoizedSupplier.valueOf(
+        () -> Optional.ofNullable(smStorage.getTmpDir()).orElseGet(() -> dir.get().getTmpDir()));
+
+    final Supplier<Path> smDir = MemoizedSupplier.valueOf(() -> dir.get().getStateMachineDir().toPath());
+    this.getRelativePath = c -> smDir.get().relativize(
+        new File(dir.get().getRoot(), c.getFilename()).toPath()).toString();
   }
 
-  public void installSnapshot(StateMachine stateMachine,
-      InstallSnapshotRequestProto request) throws IOException {
-    final InstallSnapshotRequestProto.SnapshotChunkProto snapshotChunkRequest =
-        request.getSnapshotChunk();
+  public void installSnapshot(InstallSnapshotRequestProto request, StateMachine stateMachine, RaftStorageDirectory dir)
+      throws IOException {
+    final InstallSnapshotRequestProto.SnapshotChunkProto snapshotChunkRequest = request.getSnapshotChunk();
     final long lastIncludedIndex = snapshotChunkRequest.getTermIndex().getIndex();
-    final RaftStorageDirectory dir = storage.getStorageDir();
 
     // create a unique temporary directory
-    final File tmpDir =  new File(dir.getTmpDir(), "snapshot-" + snapshotChunkRequest.getRequestId());
+    final File tmpDir =  new File(tmp.get(), "snapshot-" + snapshotChunkRequest.getRequestId());
     FileUtils.createDirectories(tmpDir);
     tmpDir.deleteOnExit();
 
-    LOG.info("Installing snapshot:{}, to tmp dir:{}", request, tmpDir);
+    LOG.info("Installing snapshot:{}, to tmp dir:{}",
+        ServerStringUtils.toInstallSnapshotRequestString(request), tmpDir);
 
     // TODO: Make sure that subsequent requests for the same installSnapshot are coming in order,
     // and are not lost when whole request cycle is done. Check requestId and requestIndex here
 
-    final Path stateMachineDir = dir.getStateMachineDir().toPath();
     for (FileChunkProto chunk : snapshotChunkRequest.getFileChunksList()) {
       SnapshotInfo pi = stateMachine.getLatestSnapshot();
       if (pi != null && pi.getTermIndex().getIndex() >= lastIncludedIndex) {
@@ -88,9 +101,7 @@ public class SnapshotManager {
             + " with endIndex >= lastIncludedIndex " + lastIncludedIndex);
       }
 
-      String fileName = chunk.getFilename(); // this is relative to the root dir
-      final Path relative = stateMachineDir.relativize(new File(dir.getRoot(), fileName).toPath());
-      final File tmpSnapshotFile = new File(tmpDir, relative.toString());
+      final File tmpSnapshotFile = new File(tmpDir, getRelativePath.apply(chunk));
       FileUtils.createDirectories(tmpSnapshotFile);
 
       FileOutputStream out = null;
@@ -149,7 +160,7 @@ public class SnapshotManager {
     }
 
     if (snapshotChunkRequest.getDone()) {
-      rename(tmpDir, dir.getStateMachineDir());
+      rename(tmpDir, snapshotDir.get());
     }
   }
 

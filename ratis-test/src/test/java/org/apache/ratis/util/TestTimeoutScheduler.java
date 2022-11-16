@@ -17,10 +17,10 @@
  */
 package org.apache.ratis.util;
 
-import org.apache.log4j.Level;
 import org.apache.ratis.BaseTest;
 import org.junit.Assert;
 import org.junit.Test;
+import org.slf4j.event.Level;
 
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -28,7 +28,7 @@ import java.util.function.Consumer;
 
 public class TestTimeoutScheduler extends BaseTest {
   {
-    Log4jUtils.setLogLevel(TimeoutScheduler.LOG, Level.ALL);
+    Slf4jUtils.setLogLevel(TimeoutScheduler.LOG, Level.TRACE);
   }
 
   static class ErrorHandler implements Consumer<RuntimeException> {
@@ -223,7 +223,7 @@ public class TestTimeoutScheduler extends BaseTest {
     }
     HUNDRED_MILLIS.sleep();
     HUNDRED_MILLIS.sleep();
-    JavaUtils.attempt(() -> Assert.assertEquals(1, scheduler.getQueueSize()),
+    JavaUtils.attempt(() -> Assert.assertEquals(1, scheduler.getTaskCount()),
         10, HUNDRED_MILLIS, "only 1 shutdown task is scheduled", LOG);
 
     final TimeDuration oneMillis = TimeDuration.valueOf(1, TimeUnit.MILLISECONDS);
@@ -234,7 +234,7 @@ public class TestTimeoutScheduler extends BaseTest {
       oneMillis.sleep();
     }
     HUNDRED_MILLIS.sleep();
-    JavaUtils.attempt(() -> Assert.assertEquals(1, scheduler.getQueueSize()),
+    JavaUtils.attempt(() -> Assert.assertEquals(1, scheduler.getTaskCount()),
         10, HUNDRED_MILLIS, "only 1 shutdown task is scheduled", LOG);
 
     errorHandler.assertNoError();

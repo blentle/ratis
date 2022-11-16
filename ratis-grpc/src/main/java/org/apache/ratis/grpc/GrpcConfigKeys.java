@@ -97,12 +97,22 @@ public interface GrpcConfigKeys {
   interface Admin {
     String PREFIX = GrpcConfigKeys.PREFIX + ".admin";
 
+    String HOST_KEY = PREFIX + ".host";
+    String HOST_DEFAULT = null;
+    static String host(RaftProperties properties) {
+      final String fallbackServerHost = Server.host(properties, null);
+      return get(properties::get, HOST_KEY, HOST_DEFAULT, Server.HOST_KEY, fallbackServerHost, getDefaultLog());
+    }
+    static void setHost(RaftProperties properties, String host) {
+      set(properties::set, HOST_KEY, host);
+    }
+
     String PORT_KEY = PREFIX + ".port";
     int PORT_DEFAULT = -1;
     static int port(RaftProperties properties) {
       final int fallbackServerPort = Server.port(properties, null);
-      return getInt(properties::getInt,
-          PORT_KEY, PORT_DEFAULT, fallbackServerPort, getDefaultLog(), requireMin(-1), requireMax(65536));
+      return getInt(properties::getInt, PORT_KEY, PORT_DEFAULT, Server.PORT_KEY, fallbackServerPort,
+          getDefaultLog(), requireMin(-1), requireMax(65536));
     }
     static void setPort(RaftProperties properties, int port) {
       setInt(properties::setInt, PORT_KEY, port);
@@ -121,12 +131,22 @@ public interface GrpcConfigKeys {
   interface Client {
     String PREFIX = GrpcConfigKeys.PREFIX + ".client";
 
+    String HOST_KEY = PREFIX + ".host";
+    String HOST_DEFAULT = null;
+    static String host(RaftProperties properties) {
+      final String fallbackServerHost = Server.host(properties, null);
+      return get(properties::get, HOST_KEY, HOST_DEFAULT, Server.HOST_KEY, fallbackServerHost, getDefaultLog());
+    }
+    static void setHost(RaftProperties properties, String host) {
+      set(properties::set, HOST_KEY, host);
+    }
+
     String PORT_KEY = PREFIX + ".port";
     int PORT_DEFAULT = -1;
     static int port(RaftProperties properties) {
       final int fallbackServerPort = Server.port(properties, null);
-      return getInt(properties::getInt,
-          PORT_KEY, PORT_DEFAULT, fallbackServerPort, getDefaultLog(), requireMin(-1), requireMax(65536));
+      return getInt(properties::getInt, PORT_KEY, PORT_DEFAULT, Server.PORT_KEY, fallbackServerPort,
+          getDefaultLog(), requireMin(-1), requireMax(65536));
     }
     static void setPort(RaftProperties properties, int port) {
       setInt(properties::setInt, PORT_KEY, port);
@@ -144,6 +164,20 @@ public interface GrpcConfigKeys {
 
   interface Server {
     String PREFIX = GrpcConfigKeys.PREFIX + ".server";
+
+    String HOST_KEY = PREFIX + ".host";
+    String HOST_DEFAULT = null;
+    static String host(RaftProperties properties) {
+      return host(properties, getDefaultLog());
+    }
+
+    static String host(RaftProperties properties, Consumer<String> logger) {
+      return get(properties::get, HOST_KEY, HOST_DEFAULT, logger);
+    }
+
+    static void setHost(RaftProperties properties, String host) {
+      set(properties::set, HOST_KEY, host);
+    }
 
     String PORT_KEY = PREFIX + ".port";
     int PORT_DEFAULT = 0;
@@ -206,8 +240,8 @@ public interface GrpcConfigKeys {
       return getBoolean(properties::getBoolean, HEARTBEAT_CHANNEL_KEY,
               HEARTBEAT_CHANNEL_DEFAULT, getDefaultLog());
     }
-    static void setHeartbeatChannel(RaftProperties properties, boolean useCached) {
-      setBoolean(properties::setBoolean, HEARTBEAT_CHANNEL_KEY, useCached);
+    static void setHeartbeatChannel(RaftProperties properties, boolean useSeparate) {
+      setBoolean(properties::setBoolean, HEARTBEAT_CHANNEL_KEY, useSeparate);
     }
   }
 

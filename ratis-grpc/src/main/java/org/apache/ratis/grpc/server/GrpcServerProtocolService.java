@@ -17,7 +17,6 @@
  */
 package org.apache.ratis.grpc.server;
 
-import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import org.apache.ratis.grpc.GrpcUtil;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
@@ -106,7 +105,6 @@ class GrpcServerProtocolService extends RaftServerProtocolServiceImplBase {
     }
 
     @Override
-    @SuppressFBWarnings("NP_NULL_PARAM_DEREF")
     public void onNext(REQUEST request) {
       if (!replyInOrder(request)) {
         try {
@@ -193,6 +191,20 @@ class GrpcServerProtocolService extends RaftServerProtocolServiceImplBase {
     } catch (Throwable e) {
       GrpcUtil.warn(LOG,
           () -> getId() + ": Failed startLeaderElection " + ProtoUtils.toString(request.getServerRequest()), e);
+      responseObserver.onError(GrpcUtil.wrapException(e));
+    }
+  }
+
+  @Override
+  public void readIndex(ReadIndexRequestProto request, StreamObserver<ReadIndexReplyProto> responseObserver) {
+    try {
+      server.readIndexAsync(request).thenAccept(reply -> {
+        responseObserver.onNext(reply);
+        responseObserver.onCompleted();
+      });
+    } catch (Throwable e) {
+      GrpcUtil.warn(LOG,
+          () -> getId() + ": Failed readIndex " + ProtoUtils.toString(request.getServerRequest()), e);
       responseObserver.onError(GrpcUtil.wrapException(e));
     }
   }

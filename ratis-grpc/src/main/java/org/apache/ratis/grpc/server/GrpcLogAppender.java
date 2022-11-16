@@ -21,6 +21,7 @@ import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.grpc.GrpcUtil;
 import org.apache.ratis.grpc.metrics.GrpcServerMetrics;
+import org.apache.ratis.metrics.Timekeeper;
 import org.apache.ratis.proto.RaftProtos.InstallSnapshotResult;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
@@ -47,8 +48,8 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-
-import org.apache.ratis.thirdparty.com.codahale.metrics.Timer;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * A new log appender implementation using grpc bi-directional stream API.
@@ -56,14 +57,24 @@ import org.apache.ratis.thirdparty.com.codahale.metrics.Timer;
 public class GrpcLogAppender extends LogAppenderBase {
   public static final Logger LOG = LoggerFactory.getLogger(GrpcLogAppender.class);
 
+  private static final Comparator<Long> CALL_ID_COMPARATOR = (left, right) -> {
+    // calculate diff in order to take care the possibility of numerical overflow
+    final long diff = left - right;
+    return diff == 0? 0: diff > 0? 1: -1;
+  };
+
+  private final AtomicLong callId = new AtomicLong();
+
   private final RequestMap pendingRequests = new RequestMap();
   private final int maxPendingRequestsNum;
-  private long callId = 0;
   private volatile boolean firstResponseReceived = false;
   private final boolean installSnapshotEnabled;
 
   private final TimeDuration requestTimeoutDuration;
-  private final TimeoutScheduler scheduler = TimeoutScheduler.getInstance();
+  private final TimeoutExecutor scheduler = TimeoutExecutor.getInstance();
+
+  private final long waitTimeMinMs;
+  private final AtomicReference<Timestamp> lastAppendEntries;
 
   private volatile StreamObservers appendLogRequestObserver;
   private final boolean useSeparateHBChannel;
@@ -83,6 +94,10 @@ public class GrpcLogAppender extends LogAppenderBase {
     this.requestTimeoutDuration = RaftServerConfigKeys.Rpc.requestTimeout(properties);
     this.installSnapshotEnabled = RaftServerConfigKeys.Log.Appender.installSnapshotEnabled(properties);
     this.useSeparateHBChannel = GrpcConfigKeys.Server.heartbeatChannel(properties);
+
+    final TimeDuration waitTimeMin = RaftServerConfigKeys.Log.Appender.waitTimeMin(properties);
+    this.waitTimeMinMs = waitTimeMin.toLong(TimeUnit.MILLISECONDS);
+    this.lastAppendEntries = new AtomicReference<>(Timestamp.currentTime().addTime(waitTimeMin.negate()));
 
     grpcServerMetrics = new GrpcServerMetrics(server.getMemberId().toString());
     grpcServerMetrics.addPendingRequestsCount(getFollowerId().toString(), pendingRequests::logRequestsSize);
@@ -165,9 +180,10 @@ public class GrpcLogAppender extends LogAppenderBase {
       // For normal nodes, new entries should be sent ASAP
       // however for slow followers (especially when the follower is down),
       // keep sending without any wait time only ends up in high CPU load
-      return 0L;
+      final long min = waitTimeMinMs - lastAppendEntries.get().elapsedTimeMs();
+      return Math.max(0L, min);
     }
-    return Math.min(10L, getHeartbeatWaitTimeMs());
+    return Math.min(waitTimeMinMs, getHeartbeatWaitTimeMs());
   }
 
   private boolean isSlowFollower() {
@@ -235,15 +251,23 @@ public class GrpcLogAppender extends LogAppenderBase {
     }
   }
 
+  @Override
+  public long getCallId() {
+    return callId.get();
+  }
+
+  @Override
+  public Comparator<Long> getCallIdComparator() {
+    return CALL_ID_COMPARATOR;
+  }
+
   private void appendLog(boolean excludeLogEntries) throws IOException {
     final AppendEntriesRequestProto pending;
     final AppendEntriesRequest request;
-    final StreamObserver<AppendEntriesRequestProto> s;
     try (AutoCloseableLock writeLock = lock.writeLock(caller, LOG::trace)) {
-      // prepare and enqueue the append request. note changes on follower's
-      // nextIndex and ops on pendingRequests should always be associated
-      // together and protected by the lock
-      pending = newAppendEntriesRequest(callId++, excludeLogEntries);
+      // Prepare and send the append request.
+      // Note changes on follower's nextIndex and ops on pendingRequests should always be done under the write-lock
+      pending = newAppendEntriesRequest(callId.getAndIncrement(), excludeLogEntries);
       if (pending == null) {
         return;
       }
@@ -264,18 +288,20 @@ public class GrpcLogAppender extends LogAppenderBase {
   private void sendRequest(AppendEntriesRequest request, AppendEntriesRequestProto proto) {
     CodeInjectionForTesting.execute(GrpcService.GRPC_SEND_SERVER_REQUEST,
         getServer().getId(), null, proto);
-    request.startRequestTimer();
-    boolean sent = Optional.ofNullable(appendLogRequestObserver).map(observer -> {
-        observer.onNext(proto);
-        return true;}).isPresent();
+    resetHeartbeatTrigger();
+    final boolean sent = Optional.ofNullable(appendLogRequestObserver)
+        .map(observer -> {
+          request.startRequestTimer();
+          observer.onNext(proto);
+          lastAppendEntries.set(Timestamp.currentTime());
+          return true;
+        }).isPresent();
 
     if (sent) {
       scheduler.onTimeout(requestTimeoutDuration,
           () -> timeoutAppendRequest(request.getCallId(), request.isHeartbeat()),
           LOG, () -> "Timeout check failed for append entry request: " + request);
       getFollower().updateLastRpcSendTime(request.isHeartbeat());
-    } else {
-      request.stopRequestTimer();
     }
   }
 
@@ -363,6 +389,7 @@ public class GrpcLogAppender extends LogAppenderBase {
         default:
           throw new IllegalStateException("Unexpected reply result: " + reply.getResult());
       }
+      getLeaderState().onAppendEntriesReply(GrpcLogAppender.this, reply);
       notifyLogAppender();
     }
 
@@ -676,8 +703,8 @@ public class GrpcLogAppender extends LogAppenderBase {
   }
 
   static class AppendEntriesRequest {
-    private final Timer timer;
-    private volatile Timer.Context timerContext;
+    private final Timekeeper timer;
+    private volatile Timekeeper.Context timerContext;
 
     private final long callId;
     private final TermIndex previousLog;

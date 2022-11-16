@@ -48,6 +48,12 @@ public interface ConfUtils {
     }
   }
 
+  static <T> void logFallback(String key, String fallbackKey, T fallbackValue, Consumer<String> logger) {
+    if (logger != null) {
+      logger.accept(String.format("%s = %s (fallback to %s)", key, fallbackValue, fallbackKey));
+    }
+  }
+
   static void logSet(String key, Object value) {
     LOG.debug("set {} = {}", key, value);
   }
@@ -156,9 +162,9 @@ public interface ConfUtils {
   @SafeVarargs
   static int getInt(
       BiFunction<String, Integer, Integer> integerGetter,
-      String key, int defaultValue, int fallbackValue,
+      String key, int defaultValue, String fallbackKey, int fallbackValue,
       Consumer<String> logger, BiConsumer<String, Integer>... assertions) {
-    return get(integerGetter, key, defaultValue, fallbackValue, logger, assertions);
+    return get(integerGetter, key, defaultValue, fallbackKey, fallbackValue, logger, assertions);
   }
 
   @SafeVarargs
@@ -208,6 +214,17 @@ public interface ConfUtils {
     return value;
   }
 
+  @SafeVarargs
+  static TimeDuration getTimeDuration(
+        BiFunction<String, TimeDuration, TimeDuration> getter,
+        String key, TimeDuration defaultValue, String fallbackKey, TimeDuration fallbackValue,
+        Consumer<String> logger, BiConsumer<String, TimeDuration>... assertions) {
+    final TimeDuration value = get(getter, key, defaultValue, fallbackKey, fallbackValue, logger, assertions);
+    requireNonNegativeTimeDuration().accept(key, value);
+    return value;
+  }
+
+
   static TlsConf getTlsConf(
       Function<String, TlsConf> tlsConfGetter,
       String key, Consumer<String> logger) {
@@ -225,12 +242,16 @@ public interface ConfUtils {
 
   @SafeVarargs
   static <T> T get(BiFunction<String, T, T> getter,
-      String key, T defaultValue, T fallbackValue,
+      String key, T defaultValue, String fallbackKey, T fallbackValue,
       Consumer<String> logger, BiConsumer<String, T>... assertions) {
     T value = get(getter, key, defaultValue, null, assertions);
-    value = value != defaultValue ? value : fallbackValue;
-    logGet(key, value, defaultValue, logger);
-    return value;
+    if (value != defaultValue) {
+      logGet(key, value, defaultValue, logger);
+      return value;
+    } else {
+      logFallback(key, fallbackKey, fallbackValue, logger);
+      return fallbackValue;
+    }
   }
 
   static InetSocketAddress getInetSocketAddress(

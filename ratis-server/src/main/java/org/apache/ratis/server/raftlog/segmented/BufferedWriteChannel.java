@@ -17,6 +17,7 @@
  */
 package org.apache.ratis.server.raftlog.segmented;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import org.apache.ratis.util.Preconditions;
 import org.apache.ratis.util.function.CheckedBiFunction;
 
@@ -29,6 +30,7 @@ import java.nio.channels.FileChannel;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Provides a buffering layer in front of a FileChannel for writing.
@@ -51,6 +53,9 @@ class BufferedWriteChannel implements Closeable {
   private final FileChannel fileChannel;
   private final ByteBuffer writeBuffer;
   private boolean forced = true;
+  private final AtomicReference<CompletableFuture<Void>> flushFuture
+      = new AtomicReference<>(CompletableFuture.completedFuture(null));
+
 
   BufferedWriteChannel(FileChannel fileChannel, ByteBuffer byteBuffer) {
     this.fileChannel = fileChannel;
@@ -58,9 +63,12 @@ class BufferedWriteChannel implements Closeable {
   }
 
   void write(byte[] b) throws IOException {
+    write(b, b.length);
+  }
+  void write(byte[] b, int len) throws IOException {
     int offset = 0;
-    while (offset < b.length) {
-      int toPut = Math.min(b.length - offset, writeBuffer.remaining());
+    while (offset < len) {
+      int toPut = Math.min(len - offset, writeBuffer.remaining());
       writeBuffer.put(b, offset, toPut);
       offset += toPut;
       if (writeBuffer.remaining() == 0) {
@@ -94,17 +102,18 @@ class BufferedWriteChannel implements Closeable {
   CompletableFuture<Void> asyncFlush(ExecutorService executor) throws IOException {
     flushBuffer();
     if (forced) {
-      return CompletableFuture.completedFuture(null);
+      return flushFuture.get();
     }
     final CompletableFuture<Void> f = CompletableFuture.supplyAsync(this::fileChannelForce, executor);
     forced = true;
-    return f;
+    return flushFuture.updateAndGet(previous -> f.thenCombine(previous, (current, prev) -> current));
   }
 
   private Void fileChannelForce() {
     try {
       fileChannel.force(false);
     } catch (IOException e) {
+      LogSegment.LOG.error("Failed to flush channel", e);
       throw new CompletionException(e);
     }
     return null;
@@ -133,12 +142,14 @@ class BufferedWriteChannel implements Closeable {
   }
 
   @Override
+  @SuppressFBWarnings("RV_RETURN_VALUE_IGNORED_NO_SIDE_EFFECT")
   public void close() throws IOException {
     if (!isOpen()) {
       return;
     }
 
     try {
+      flushFuture.get().join();
       fileChannel.truncate(fileChannel.position());
     } finally {
       fileChannel.close();

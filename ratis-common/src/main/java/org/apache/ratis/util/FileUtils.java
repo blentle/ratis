@@ -76,9 +76,15 @@ public interface FileUtils {
   }
 
   static void move(Path src, Path dst) throws IOException {
-    LogUtils.runAndLog(LOG,
+    try {
+      LogUtils.runAndLog(LOG,
+        () -> Files.move(src, dst, StandardCopyOption.ATOMIC_MOVE),
+        () -> "Atomic Files.move " + src + " to " + dst);
+    } catch (AtomicMoveNotSupportedException e) {
+      LogUtils.runAndLog(LOG,
         () -> Files.move(src, dst),
-        () -> "Files.move " + src + " to " + dst);
+        () -> "Atomic move not supported. Fallback to Files.move " + src + " to " + dst);
+    }
   }
 
   /**
@@ -138,11 +144,13 @@ public interface FileUtils {
   }
 
   /** The same as passing f.toPath() to {@link #delete(Path)}. */
-  static void deleteFileQuietly(File f) {
+  static boolean deleteFileQuietly(File f) {
     try {
       delete(f.toPath());
+      return true;
     } catch (Exception ex) {
-      LOG.debug("File delete was not susccesful {}", f.getAbsoluteFile(), ex);
+      LOG.debug("File delete was not successful {}", f.getAbsoluteFile(), ex);
+      return false;
     }
   }
 

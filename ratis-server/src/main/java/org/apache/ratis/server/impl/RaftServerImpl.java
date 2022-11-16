@@ -20,9 +20,12 @@ package org.apache.ratis.server.impl;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.impl.ClientProtoUtils;
 import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.metrics.Timekeeper;
 import org.apache.ratis.proto.RaftProtos.*;
 import org.apache.ratis.proto.RaftProtos.RaftClientRequestProto.TypeCase;
 import org.apache.ratis.protocol.*;
+import org.apache.ratis.protocol.exceptions.ReadException;
+import org.apache.ratis.protocol.exceptions.ReadIndexException;
 import org.apache.ratis.protocol.exceptions.SetConfigurationException;
 import org.apache.ratis.protocol.exceptions.GroupMismatchException;
 import org.apache.ratis.protocol.exceptions.LeaderNotReadyException;
@@ -63,6 +66,7 @@ import org.apache.ratis.statemachine.StateMachine;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.thirdparty.com.google.protobuf.InvalidProtocolBufferException;
 import org.apache.ratis.util.*;
+import org.apache.ratis.util.function.CheckedSupplier;
 
 import javax.management.ObjectName;
 import java.io.File;
@@ -92,12 +96,9 @@ import static org.apache.ratis.util.LifeCycle.State.PAUSING;
 import static org.apache.ratis.util.LifeCycle.State.RUNNING;
 import static org.apache.ratis.util.LifeCycle.State.STARTING;
 
-import org.apache.ratis.thirdparty.com.codahale.metrics.Timer;
-import org.apache.ratis.util.function.CheckedSupplier;
-
 class RaftServerImpl implements RaftServer.Division,
     RaftServerProtocol, RaftServerAsynchronousProtocol,
-    RaftClientProtocol, RaftClientAsynchronousProtocol{
+    RaftClientProtocol, RaftClientAsynchronousProtocol {
   private static final String CLASS_NAME = JavaUtils.getClassSimpleName(RaftServerImpl.class);
   static final String REQUEST_VOTE = CLASS_NAME + ".requestVote";
   static final String APPEND_ENTRIES = CLASS_NAME + ".appendEntries";
@@ -163,6 +164,7 @@ class RaftServerImpl implements RaftServer.Division,
   private final RoleInfo role;
 
   private final DataStreamMap dataStreamMap;
+  private final RaftServerConfigKeys.Read.Option readOption;
 
   private final MemoizedSupplier<RaftClient> raftClient;
 
@@ -187,7 +189,11 @@ class RaftServerImpl implements RaftServer.Division,
   private final ExecutorService serverExecutor;
   private final ExecutorService clientExecutor;
 
-  RaftServerImpl(RaftGroup group, StateMachine stateMachine, RaftServerProxy proxy) throws IOException {
+  private final AtomicBoolean firstElectionSinceStartup = new AtomicBoolean(true);
+  private final ThreadGroup threadGroup;
+
+  RaftServerImpl(RaftGroup group, StateMachine stateMachine, RaftServerProxy proxy, RaftStorage.StartupOption option)
+      throws IOException {
     final RaftPeerId id = proxy.getId();
     LOG.info("{}: new RaftServerImpl for {} with {}", id, group, stateMachine);
     this.lifeCycle = new LifeCycle(id);
@@ -200,9 +206,10 @@ class RaftServerImpl implements RaftServer.Division,
     this.sleepDeviationThreshold = RaftServerConfigKeys.sleepDeviationThreshold(properties);
     this.proxy = proxy;
 
-    this.state = new ServerState(id, group, properties, this, stateMachine);
+    this.state = new ServerState(id, group, stateMachine, this, option, properties);
     this.retryCache = new RetryCacheImpl(properties);
     this.dataStreamMap = new DataStreamMapImpl(id);
+    this.readOption = RaftServerConfigKeys.Read.option(properties);
 
     this.jmxAdapter = new RaftServerJmxAdapter();
     this.leaderElectionMetrics = LeaderElectionMetrics.getLeaderElectionMetrics(
@@ -211,6 +218,7 @@ class RaftServerImpl implements RaftServer.Division,
         getMemberId(), () -> commitInfoCache::get, retryCache::getStatistics);
 
     this.startComplete = new AtomicBoolean(false);
+    this.threadGroup = new ThreadGroup(proxy.getThreadGroup(), getMemberId().toString());
 
     this.raftClient = JavaUtils.memoize(() -> RaftClient.newBuilder()
         .setRaftGroup(group)
@@ -245,9 +253,20 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   TimeDuration getRandomElectionTimeout() {
+    if (firstElectionSinceStartup.get()) {
+      return getFirstRandomElectionTimeout();
+    }
     final int min = properties().minRpcTimeoutMs();
     final int millis = min + ThreadLocalRandom.current().nextInt(properties().maxRpcTimeoutMs() - min + 1);
     return TimeDuration.valueOf(millis, TimeUnit.MILLISECONDS);
+  }
+
+  private TimeDuration getFirstRandomElectionTimeout() {
+    final RaftProperties properties = proxy.getProperties();
+    final int min = RaftServerConfigKeys.Rpc.firstElectionTimeoutMin(properties).toIntExact(TimeUnit.MILLISECONDS);
+    final int max = RaftServerConfigKeys.Rpc.firstElectionTimeoutMax(properties).toIntExact(TimeUnit.MILLISECONDS);
+    final int mills = min + ThreadLocalRandom.current().nextInt(max - min + 1);
+    return TimeDuration.valueOf(mills, TimeUnit.MILLISECONDS);
   }
 
   TimeDuration getLeaderStepDownWaitTime() {
@@ -256,6 +275,11 @@ class RaftServerImpl implements RaftServer.Division,
 
   TimeDuration getSleepDeviationThreshold() {
     return sleepDeviationThreshold;
+  }
+
+  @Override
+  public ThreadGroup getThreadGroup() {
+    return threadGroup;
   }
 
   @Override
@@ -562,8 +586,8 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   GroupInfoReply getGroupInfo(GroupInfoRequest request) {
-    return new GroupInfoReply(request, getCommitInfos(),
-        getGroup(), getRoleInfoProto(), state.getStorage().getStorageDir().isHealthy());
+    final RaftStorageDirectory dir = state.getStorage().getStorageDir();
+    return new GroupInfoReply(request, getCommitInfos(), getGroup(), getRoleInfoProto(), dir.isHealthy());
   }
 
   RoleInfoProto getRoleInfoProto() {
@@ -801,12 +825,15 @@ class RaftServerImpl implements RaftServer.Division,
       RaftClientRequest request) throws IOException {
     assertLifeCycleState(LifeCycle.States.RUNNING);
     LOG.debug("{}: receive client request({})", getMemberId(), request);
-    final Optional<Timer> timer = Optional.ofNullable(raftServerMetrics.getClientRequestTimer(request.getType()));
+    final Timekeeper timer = raftServerMetrics.getClientRequestTimer(request.getType());
+    final Optional<Timekeeper.Context> timerContext = Optional.ofNullable(timer).map(Timekeeper::time);
 
     final CompletableFuture<RaftClientReply> replyFuture;
 
     if (request.is(TypeCase.STALEREAD)) {
       replyFuture = staleReadAsync(request);
+    } else if (request.is(TypeCase.READ)) {
+      replyFuture = readAsync(request);
     } else {
       // first check the server's leader state
       CompletableFuture<RaftClientReply> reply = checkLeaderState(request, null,
@@ -828,11 +855,7 @@ class RaftServerImpl implements RaftServer.Division,
         }
       }
 
-      if (type.is(TypeCase.READ)) {
-        // TODO: We might not be the leader anymore by the time this completes.
-        // See the RAFT paper section 8 (last part)
-        replyFuture = processQueryFuture(stateMachine.query(request.getMessage()), request);
-      } else if (type.is(TypeCase.WATCH)) {
+      if (type.is(TypeCase.WATCH)) {
         replyFuture = watchAsync(request);
       } else if (type.is(TypeCase.MESSAGESTREAM)) {
         replyFuture = streamAsync(request);
@@ -864,7 +887,7 @@ class RaftServerImpl implements RaftServer.Division,
     final RaftClientRequest.Type type = request.getType();
     replyFuture.whenComplete((clientReply, exception) -> {
       if (clientReply.isSuccess()) {
-        timer.map(Timer::time).ifPresent(Timer.Context::stop);
+        timerContext.ifPresent(Timekeeper.Context::stop);
       }
       if (exception != null || clientReply.getException() != null) {
         raftServerMetrics.incFailedRequestCount(type);
@@ -893,6 +916,75 @@ class RaftServerImpl implements RaftServer.Division,
     return processQueryFuture(stateMachine.queryStale(request.getMessage(), minIndex), request);
   }
 
+  ReadRequests getReadRequests() {
+    return getState().getReadRequests();
+  }
+
+  private CompletableFuture<ReadIndexReplyProto> sendReadIndexAsync() {
+    if (getInfo().getLeaderId() == null) {
+      JavaUtils.completeExceptionally(generateNotLeaderException());
+    }
+    final ReadIndexRequestProto request = ServerProtoUtils.toReadIndexRequestProto(
+        getMemberId(),  getInfo().getLeaderId());
+    try {
+      return getServerRpc().async().readIndexAsync(request);
+    } catch (IOException e) {
+      return JavaUtils.completeExceptionally(e);
+    }
+  }
+
+  private CompletableFuture<RaftClientReply> readAsync(RaftClientRequest request) {
+    if (readOption == RaftServerConfigKeys.Read.Option.LINEARIZABLE) {
+      /*
+        Linearizable read using ReadIndex. See Raft paper section 6.4.
+        1. First obtain readIndex from Leader.
+        2. Then waits for statemachine to advance at least as far as readIndex.
+        3. Finally, query the statemachine and return the result.
+       */
+      final LeaderStateImpl leader = role.getLeaderState().orElse(null);
+
+      final CompletableFuture<Long> replyFuture;
+      if (leader != null) {
+        replyFuture = leader.getReadIndex();
+      } else {
+        replyFuture = sendReadIndexAsync().thenApply(reply   -> {
+          if (reply.getServerReply().getSuccess()) {
+            return reply.getReadIndex();
+          } else {
+            throw new CompletionException(new ReadIndexException(getId() +
+                ": Failed to get read index from the leader: " + reply));
+          }
+        });
+      }
+
+      return replyFuture
+          .thenCompose(readIndex -> getReadRequests().waitToAdvance(readIndex))
+          .thenCompose(readIndex -> queryStateMachine(request))
+          .exceptionally(e -> readException2Reply(request, e));
+    } else if (readOption == RaftServerConfigKeys.Read.Option.DEFAULT) {
+       CompletableFuture<RaftClientReply> reply = checkLeaderState(request, null, false);
+       if (reply != null) {
+         return reply;
+       }
+       return queryStateMachine(request);
+    } else {
+      throw new IllegalStateException("Unexpected read option: " + readOption);
+    }
+  }
+
+  private RaftClientReply readException2Reply(RaftClientRequest request, Throwable e) {
+    e = JavaUtils.unwrapCompletionException(e);
+    if (e instanceof StateMachineException ) {
+      return newExceptionReply(request, (StateMachineException) e);
+    } else if (e instanceof ReadException) {
+      return newExceptionReply(request, (ReadException) e);
+    } else if (e instanceof ReadIndexException) {
+      return newExceptionReply(request, (ReadIndexException) e);
+    } else {
+      throw new CompletionException(e);
+    }
+  }
+
   private CompletableFuture<RaftClientReply> streamAsync(RaftClientRequest request) {
     return role.getLeaderState()
         .map(ls -> ls.streamAsync(request))
@@ -904,6 +996,10 @@ class RaftServerImpl implements RaftServer.Division,
     return role.getLeaderState()
         .map(ls -> ls.streamEndOfRequestAsync(request))
         .orElse(null);
+  }
+
+  CompletableFuture<RaftClientReply> queryStateMachine(RaftClientRequest request) {
+    return processQueryFuture(stateMachine.query(request.getMessage()), request);
   }
 
   CompletableFuture<RaftClientReply> processQueryFuture(
@@ -1236,27 +1332,31 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   private void validateEntries(long expectedTerm, TermIndex previous,
-      LogEntryProto... entries) {
-    if (entries != null && entries.length > 0) {
-      final long index0 = entries[0].getIndex();
-
-      if (previous == null || previous.getTerm() == 0) {
-        Preconditions.assertTrue(index0 == 0,
-            "Unexpected Index: previous is null but entries[%s].getIndex()=%s",
-            0, index0);
-      } else {
-        Preconditions.assertTrue(previous.getIndex() == index0 - 1,
-            "Unexpected Index: previous is %s but entries[%s].getIndex()=%s",
-            previous, 0, index0);
+      List<LogEntryProto> entries) {
+    if (entries != null && !entries.isEmpty()) {
+      final long index0 = entries.get(0).getIndex();
+      // Check if next entry's index is 1 greater than the snapshotIndex. If yes, then
+      // we do not have to check for the existence of previous.
+      if (index0 != state.getSnapshotIndex() + 1) {
+        if (previous == null || previous.getTerm() == 0) {
+          Preconditions.assertTrue(index0 == 0,
+              "Unexpected Index: previous is null but entries[%s].getIndex()=%s",
+              0, index0);
+        } else {
+          Preconditions.assertTrue(previous.getIndex() == index0 - 1,
+              "Unexpected Index: previous is %s but entries[%s].getIndex()=%s",
+              previous, 0, index0);
+        }
       }
 
-      for (int i = 0; i < entries.length; i++) {
-        final long t = entries[i].getTerm();
+      for (int i = 0; i < entries.size(); i++) {
+        LogEntryProto entry = entries.get(i);
+        final long t = entry.getTerm();
         Preconditions.assertTrue(expectedTerm >= t,
             "Unexpected Term: entries[%s].getTerm()=%s but expectedTerm=%s",
             i, t, expectedTerm);
 
-        final long indexi = entries[i].getIndex();
+        final long indexi = entry.getIndex();
         Preconditions.assertTrue(indexi == index0 + i,
             "Unexpected Index: entries[%s].getIndex()=%s but entries[0].getIndex()=%s",
             i, indexi, index0);
@@ -1277,10 +1377,8 @@ class RaftServerImpl implements RaftServer.Division,
   @Override
   public CompletableFuture<AppendEntriesReplyProto> appendEntriesAsync(AppendEntriesRequestProto r)
       throws IOException {
-    // TODO avoid converting list to array
     final RaftRpcRequestProto request = r.getServerRequest();
-    final LogEntryProto[] entries = r.getEntriesList()
-        .toArray(new LogEntryProto[r.getEntriesCount()]);
+    final List<LogEntryProto> entries = r.getEntriesList();
     final TermIndex previous = r.hasPreviousLog()? TermIndex.valueOf(r.getPreviousLog()) : null;
     final RaftPeerId requestorId = RaftPeerId.valueOf(request.getRequestorId());
 
@@ -1293,6 +1391,24 @@ class RaftServerImpl implements RaftServer.Division,
       LOG.error("{}: Failed appendEntriesAsync {}", getMemberId(), r, t);
       throw t;
     }
+  }
+
+  @Override
+  public CompletableFuture<ReadIndexReplyProto> readIndexAsync(ReadIndexRequestProto request) throws IOException {
+    assertLifeCycleState(LifeCycle.States.RUNNING);
+
+    final RaftPeerId peerId = RaftPeerId.valueOf(request.getServerRequest().getRequestorId());
+
+    final LeaderStateImpl leader = role.getLeaderState().orElse(null);
+    if (leader == null) {
+      return CompletableFuture.completedFuture(
+          ServerProtoUtils.toReadIndexReplyProto(peerId, getMemberId(), false, INVALID_LOG_INDEX));
+    }
+
+    return leader.getReadIndex()
+        .thenApply(index -> ServerProtoUtils.toReadIndexReplyProto(peerId, getMemberId(), true, index))
+        .exceptionally(throwable ->
+            ServerProtoUtils.toReadIndexReplyProto(peerId, getMemberId(), false, INVALID_LOG_INDEX));
   }
 
   static void logAppendEntries(boolean isHeartbeat, Supplier<String> message) {
@@ -1318,7 +1434,7 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   private void preAppendEntriesAsync(RaftPeerId leaderId, RaftGroupId leaderGroupId, long leaderTerm,
-      TermIndex previous, long leaderCommit, boolean initializing, LogEntryProto... entries) throws IOException {
+      TermIndex previous, long leaderCommit, boolean initializing, List<LogEntryProto> entries) throws IOException {
     CodeInjectionForTesting.execute(APPEND_ENTRIES, getId(),
         leaderId, leaderTerm, previous, leaderCommit, initializing, entries);
 
@@ -1342,8 +1458,8 @@ class RaftServerImpl implements RaftServer.Division,
   @SuppressWarnings("checkstyle:parameternumber")
   private CompletableFuture<AppendEntriesReplyProto> appendEntriesAsync(
       RaftPeerId leaderId, long leaderTerm, TermIndex previous, long leaderCommit, long callId, boolean initializing,
-      List<CommitInfoProto> commitInfos, LogEntryProto... entries) throws IOException {
-    final boolean isHeartbeat = entries.length == 0;
+      List<CommitInfoProto> commitInfos, List<LogEntryProto> entries) throws IOException {
+    final boolean isHeartbeat = entries.isEmpty();
     logAppendEntries(isHeartbeat,
         () -> getMemberId() + ": receive appendEntries(" + leaderId + ", " + leaderTerm + ", "
             + previous + ", " + leaderCommit + ", " + initializing
@@ -1354,7 +1470,7 @@ class RaftServerImpl implements RaftServer.Division,
     final long currentTerm;
     final long followerCommit = state.getLog().getLastCommittedIndex();
     final Optional<FollowerState> followerState;
-    Timer.Context timer = raftServerMetrics.getFollowerAppendEntryTimer(isHeartbeat).time();
+    final Timekeeper.Context timer = raftServerMetrics.getFollowerAppendEntryTimer(isHeartbeat).time();
     synchronized (this) {
       // Check life cycle state again to avoid the PAUSING/PAUSED state.
       assertLifeCycleState(LifeCycle.States.STARTING_OR_RUNNING);
@@ -1400,7 +1516,7 @@ class RaftServerImpl implements RaftServer.Division,
       state.updateConfiguration(entries);
     }
 
-    final List<CompletableFuture<Long>> futures = entries.length == 0 ? Collections.emptyList()
+    final List<CompletableFuture<Long>> futures = entries.isEmpty() ? Collections.emptyList()
         : state.getLog().append(entries);
     commitInfos.forEach(commitInfoCache::update);
 
@@ -1414,16 +1530,24 @@ class RaftServerImpl implements RaftServer.Division,
       }
     }
     return JavaUtils.allOf(futures).whenCompleteAsync(
-        (r, t) -> followerState.ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.APPEND_COMPLETE))
+        (r, t) -> followerState.ifPresent(fs -> fs.updateLastRpcTime(FollowerState.UpdateType.APPEND_COMPLETE)),
+        serverExecutor
     ).thenApply(v -> {
       final AppendEntriesReplyProto reply;
       synchronized(this) {
-        final long commitIndex = ServerImplUtils.effectiveCommitIndex(leaderCommit, previous, entries.length);
+        final long commitIndex = ServerImplUtils.effectiveCommitIndex(leaderCommit, previous, entries.size());
         state.updateCommitIndex(commitIndex, currentTerm, false);
         updateCommitInfoCache();
-        final long n = isHeartbeat? state.getLog().getNextIndex(): entries[entries.length - 1].getIndex() + 1;
-        final long matchIndex = entries.length != 0 ? entries[entries.length - 1].getIndex() :
-            INVALID_LOG_INDEX;
+        final long n;
+        final long matchIndex;
+        if (!isHeartbeat) {
+          LogEntryProto requestLastEntry = entries.get(entries.size() - 1);
+          n = requestLastEntry.getIndex() + 1;
+          matchIndex = requestLastEntry.getIndex();
+        } else {
+          n = state.getLog().getNextIndex();
+          matchIndex = INVALID_LOG_INDEX;
+        }
         reply = ServerProtoUtils.toAppendEntriesReplyProto(leaderId, getMemberId(), currentTerm,
             state.getLog().getLastCommittedIndex(), n, SUCCESS, callId, matchIndex,
             isHeartbeat);
@@ -1436,7 +1560,7 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   private AppendEntriesReplyProto checkInconsistentAppendEntries(RaftPeerId leaderId, long currentTerm,
-      long followerCommit, TermIndex previous, long callId, boolean isHeartbeat, LogEntryProto... entries) {
+      long followerCommit, TermIndex previous, long callId, boolean isHeartbeat, List<LogEntryProto> entries) {
     final long replyNextIndex = checkInconsistentAppendEntries(previous, entries);
     if (replyNextIndex == -1) {
       return null;
@@ -1449,7 +1573,7 @@ class RaftServerImpl implements RaftServer.Division,
     return reply;
   }
 
-  private long checkInconsistentAppendEntries(TermIndex previous, LogEntryProto... entries) {
+  private long checkInconsistentAppendEntries(TermIndex previous, List<LogEntryProto> entries) {
     // Check if a snapshot installation through state machine is in progress.
     final long installSnapshot = snapshotInstallationHandler.getInProgressInstallSnapshotIndex();
     if (installSnapshot != INVALID_LOG_INDEX) {
@@ -1459,8 +1583,8 @@ class RaftServerImpl implements RaftServer.Division,
 
     // Check that the first log entry is greater than the snapshot index in the latest snapshot and follower's last
     // committed index. If not, reply to the leader the new next index.
-    if (entries != null && entries.length > 0) {
-      final long firstEntryIndex = entries[0].getIndex();
+    if (entries != null && !entries.isEmpty()) {
+      final long firstEntryIndex = entries.get(0).getIndex();
       final long snapshotIndex = state.getSnapshotIndex();
       final long commitIndex =  state.getLog().getLastCommittedIndex();
       final long nextIndex = Math.max(snapshotIndex, commitIndex);
@@ -1717,5 +1841,9 @@ class RaftServerImpl implements RaftServer.Division,
       return proxy.getGroupIds().stream().map(RaftGroupId::toString)
           .collect(Collectors.toList());
     }
+  }
+
+  void onGroupLeaderElected() {
+    this.firstElectionSinceStartup.set(false);
   }
 }
