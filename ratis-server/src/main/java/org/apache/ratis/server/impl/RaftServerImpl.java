@@ -317,6 +317,10 @@ class RaftServerImpl implements RaftServer.Division,
     return proxy;
   }
 
+  TransferLeadership getTransferLeadership() {
+    return transferLeadership;
+  }
+
   RaftServerRpc getServerRpc() {
     return proxy.getServerRpc();
   }
@@ -534,6 +538,7 @@ class RaftServerImpl implements RaftServer.Division,
       setRole(RaftPeerRole.FOLLOWER, reason);
       if (old == RaftPeerRole.LEADER) {
         role.shutdownLeaderState(false);
+        state.setLeader(null, reason);
       } else if (old == RaftPeerRole.CANDIDATE) {
         role.shutdownLeaderElection();
       } else if (old == RaftPeerRole.FOLLOWER) {
@@ -921,11 +926,11 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   private CompletableFuture<ReadIndexReplyProto> sendReadIndexAsync() {
-    if (getInfo().getLeaderId() == null) {
-      JavaUtils.completeExceptionally(generateNotLeaderException());
+    final RaftPeerId leaderId = getInfo().getLeaderId();
+    if (leaderId == null) {
+      return JavaUtils.completeExceptionally(new ReadIndexException(getMemberId() + ": Leader is unknown."));
     }
-    final ReadIndexRequestProto request = ServerProtoUtils.toReadIndexRequestProto(
-        getMemberId(),  getInfo().getLeaderId());
+    final ReadIndexRequestProto request = ServerProtoUtils.toReadIndexRequestProto(getMemberId(), leaderId);
     try {
       return getServerRpc().async().readIndexAsync(request);
     } catch (IOException e) {
@@ -934,7 +939,8 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   private CompletableFuture<RaftClientReply> readAsync(RaftClientRequest request) {
-    if (readOption == RaftServerConfigKeys.Read.Option.LINEARIZABLE) {
+    if (readOption == RaftServerConfigKeys.Read.Option.LINEARIZABLE
+        && !request.getType().getRead().getPreferNonLinearizable()) {
       /*
         Linearizable read using ReadIndex. See Raft paper section 6.4.
         1. First obtain readIndex from Leader.
@@ -961,7 +967,8 @@ class RaftServerImpl implements RaftServer.Division,
           .thenCompose(readIndex -> getReadRequests().waitToAdvance(readIndex))
           .thenCompose(readIndex -> queryStateMachine(request))
           .exceptionally(e -> readException2Reply(request, e));
-    } else if (readOption == RaftServerConfigKeys.Read.Option.DEFAULT) {
+    } else if (readOption == RaftServerConfigKeys.Read.Option.DEFAULT
+        || request.getType().getRead().getPreferNonLinearizable()) {
        CompletableFuture<RaftClientReply> reply = checkLeaderState(request, null, false);
        if (reply != null) {
          return reply;
@@ -1113,7 +1120,7 @@ class RaftServerImpl implements RaftServer.Division,
         return logAndReturnTransferLeadershipFail(request, msg);
       }
 
-      return transferLeadership.start(request);
+      return transferLeadership.start(leaderState, request);
     }
   }
 
@@ -1174,7 +1181,8 @@ class RaftServerImpl implements RaftServer.Division,
     assertGroup(request.getRequestorId(), request.getRaftGroupId());
 
     return role.getLeaderState().map(leader -> leader.submitStepDownRequestAsync(request))
-        .orElseGet(() -> CompletableFuture.completedFuture(newSuccessReply(request)));
+        .orElseGet(() -> CompletableFuture.completedFuture(
+            newExceptionReply(request, generateNotLeaderException())));
   }
 
   public RaftClientReply setConfiguration(SetConfigurationRequest request) throws IOException {
@@ -1525,8 +1533,7 @@ class RaftServerImpl implements RaftServer.Division,
       final long installedIndex = snapshotInstallationHandler.getInstalledIndex();
       if (installedIndex >= RaftLog.LEAST_VALID_LOG_INDEX) {
         LOG.info("{}: Follower has completed install the snapshot {}.", this, installedIndex);
-        stateMachine.event().notifySnapshotInstalled(InstallSnapshotResult.SUCCESS, installedIndex,
-            getRaftServer().getPeer());
+        stateMachine.event().notifySnapshotInstalled(InstallSnapshotResult.SUCCESS, installedIndex, getPeer());
       }
     }
     return JavaUtils.allOf(futures).whenCompleteAsync(
@@ -1832,8 +1839,8 @@ class RaftServerImpl implements RaftServer.Division,
 
     @Override
     public List<String> getFollowers() {
-      return role.getLeaderState().map(LeaderStateImpl::getFollowers).orElse(Collections.emptyList())
-          .stream().map(RaftPeer::toString).collect(Collectors.toList());
+      return role.getLeaderState().map(LeaderStateImpl::getFollowers).orElseGet(Stream::empty)
+          .map(RaftPeer::toString).collect(Collectors.toList());
     }
 
     @Override

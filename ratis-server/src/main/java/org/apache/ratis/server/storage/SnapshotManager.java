@@ -77,8 +77,7 @@ public class SnapshotManager {
         new File(dir.get().getRoot(), c.getFilename()).toPath()).toString();
   }
 
-  public void installSnapshot(InstallSnapshotRequestProto request, StateMachine stateMachine, RaftStorageDirectory dir)
-      throws IOException {
+  public void installSnapshot(InstallSnapshotRequestProto request, StateMachine stateMachine) throws IOException {
     final InstallSnapshotRequestProto.SnapshotChunkProto snapshotChunkRequest = request.getSnapshotChunk();
     final long lastIncludedIndex = snapshotChunkRequest.getTermIndex().getIndex();
 
@@ -102,7 +101,7 @@ public class SnapshotManager {
       }
 
       final File tmpSnapshotFile = new File(tmpDir, getRelativePath.apply(chunk));
-      FileUtils.createDirectories(tmpSnapshotFile);
+      FileUtils.createDirectoriesDeleteExistingNonDirectory(tmpSnapshotFile.getParentFile());
 
       FileOutputStream out = null;
       try {
@@ -114,6 +113,7 @@ public class SnapshotManager {
           }
           // create the temp snapshot file and put padding inside
           out = new FileOutputStream(tmpSnapshotFile);
+          digester.get().reset();
         } else {
           Preconditions.assertTrue(tmpSnapshotFile.exists());
           out = new FileOutputStream(tmpSnapshotFile, true);

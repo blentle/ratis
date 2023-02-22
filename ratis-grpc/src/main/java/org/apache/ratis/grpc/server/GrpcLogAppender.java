@@ -23,7 +23,6 @@ import org.apache.ratis.grpc.GrpcUtil;
 import org.apache.ratis.grpc.metrics.GrpcServerMetrics;
 import org.apache.ratis.metrics.Timekeeper;
 import org.apache.ratis.proto.RaftProtos.InstallSnapshotResult;
-import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
@@ -122,13 +121,14 @@ public class GrpcLogAppender extends LogAppenderBase {
       firstResponseReceived = false;
       // clear the pending requests queue and reset the next index of follower
       pendingRequests.clear();
+      final FollowerInfo f = getFollower();
       final long nextIndex = 1 + Optional.ofNullable(request)
           .map(AppendEntriesRequest::getPreviousLog)
           .map(TermIndex::getIndex)
-          .orElseGet(getFollower()::getMatchIndex);
-      if (onError && getFollower().getMatchIndex() == 0 && request == null) {
-        LOG.warn("{}: Leader has not got in touch with Follower {} yet, " +
-          "just keep nextIndex unchanged and retry.", this, getFollower());
+          .orElseGet(f::getMatchIndex);
+      if (onError && f.getMatchIndex() == 0 && request == null) {
+        LOG.warn("{}: Follower failed when matchIndex == 0, " +
+          " keep nextIndex ({}) unchanged and retry.", this, f.getNextIndex());
         return;
       }
       getFollower().decreaseNextIndex(nextIndex);
@@ -321,8 +321,10 @@ public class GrpcLogAppender extends LogAppenderBase {
     }
   }
 
-  private void increaseNextIndex(final long installedSnapshotIndex) {
-    getFollower().updateNextIndex(installedSnapshotIndex + 1);
+  private void increaseNextIndex(final long installedSnapshotIndex, Object reason) {
+    final long newNextIndex = installedSnapshotIndex + 1;
+    LOG.info("{}: updateNextIndex {} for {}", this, newNextIndex, reason);
+    getFollower().updateNextIndex(newNextIndex);
   }
 
   /**
@@ -378,12 +380,14 @@ public class GrpcLogAppender extends LogAppenderBase {
           break;
         case NOT_LEADER:
           grpcServerMetrics.onRequestNotLeader(getFollowerId().toString());
+          LOG.warn("{}: received {} reply with term {}", this, reply.getResult(), reply.getTerm());
           if (onFollowerTerm(reply.getTerm())) {
             return;
           }
           break;
         case INCONSISTENCY:
           grpcServerMetrics.onRequestInconsistency(getFollowerId().toString());
+          LOG.warn("{}: received {} reply with nextIndex {}", this, reply.getResult(), reply.getNextIndex());
           updateNextIndex(reply.getNextIndex());
           break;
         default:
@@ -463,12 +467,12 @@ public class GrpcLogAppender extends LogAppenderBase {
       if (followerNextIndex >= leaderStartIndex) {
         LOG.info("{}: Follower can catch up leader after install the snapshot, as leader's start index is {}",
             this, followerNextIndex);
-        notifyInstallSnapshotFinished(InstallSnapshotResult.SUCCESS, followerSnapshotIndex, getFollower().getPeer());
+        notifyInstallSnapshotFinished(InstallSnapshotResult.SUCCESS, followerSnapshotIndex);
       }
     }
 
-    void notifyInstallSnapshotFinished(InstallSnapshotResult result, long snapshotIndex, RaftPeer peer) {
-      getServer().getStateMachine().event().notifySnapshotInstalled(result, snapshotIndex, peer);
+    void notifyInstallSnapshotFinished(InstallSnapshotResult result, long snapshotIndex) {
+      getServer().getStateMachine().event().notifySnapshotInstalled(result, snapshotIndex, getFollower().getPeer());
     }
 
     boolean isDone() {
@@ -516,7 +520,7 @@ public class GrpcLogAppender extends LogAppenderBase {
           getFollower().setSnapshotIndex(followerSnapshotIndex);
           getFollower().setAttemptedToInstallSnapshot();
           getLeaderState().onFollowerCommitIndex(getFollower(), followerSnapshotIndex);
-          increaseNextIndex(followerSnapshotIndex);
+          increaseNextIndex(followerSnapshotIndex, reply.getResult());
           removePending(reply);
           break;
         case NOT_LEADER:
@@ -533,19 +537,18 @@ public class GrpcLogAppender extends LogAppenderBase {
           getFollower().setSnapshotIndex(followerSnapshotIndex);
           getFollower().setAttemptedToInstallSnapshot();
           getLeaderState().onFollowerCommitIndex(getFollower(), followerSnapshotIndex);
-          increaseNextIndex(followerSnapshotIndex);
+          increaseNextIndex(followerSnapshotIndex, reply.getResult());
           onFollowerCatchup(followerSnapshotIndex);
           removePending(reply);
           break;
         case SNAPSHOT_UNAVAILABLE:
           LOG.info("{}: Follower could not install snapshot as it is not available.", this);
           getFollower().setAttemptedToInstallSnapshot();
-          notifyInstallSnapshotFinished(InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, RaftLog.INVALID_LOG_INDEX,
-              getFollower().getPeer());
+          notifyInstallSnapshotFinished(InstallSnapshotResult.SNAPSHOT_UNAVAILABLE, RaftLog.INVALID_LOG_INDEX);
           removePending(reply);
           break;
         case UNRECOGNIZED:
-          LOG.error("Unrecongnized the reply result {}: Leader is {}, follower is {}",
+          LOG.error("Unrecognized the reply result {}: Leader is {}, follower is {}",
               reply.getResult(), getServer().getId(), getFollowerId());
           break;
         default:

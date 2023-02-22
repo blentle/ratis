@@ -15,27 +15,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.apache.ratis.server.raftlog.segmented;
 
-import org.apache.ratis.util.SizeInBytes;
-import org.apache.ratis.util.Slf4jUtils;
-import org.slf4j.event.Level;
+package org.apache.ratis.grpc;
 
-import java.io.File;
 
-public interface SegmentedRaftLogTestUtils {
-  SizeInBytes MAX_OP_SIZE = SizeInBytes.valueOf("32MB");
+import org.apache.ratis.TestReConfigProperty;
 
-  static SegmentedRaftLogInputStream newSegmentedRaftLogInputStream(File log,
-      long startIndex, long endIndex, boolean isOpen) {
-    return new SegmentedRaftLogInputStream(log, startIndex, endIndex, isOpen, MAX_OP_SIZE, null);
-  }
-
-  static void setRaftLogWorkerLogLevel(Level level) {
-    Slf4jUtils.setLogLevel(SegmentedRaftLogWorker.LOG, level);
-  }
-
-  static String getLogFlushTimeMetric(String memberId) {
-    return SegmentedRaftLogWorker.class.getName() + "." + memberId + ".flush-time";
-  }
+public class TestReConfigPropertyWithGrpc extends TestReConfigProperty<MiniRaftClusterWithGrpc>
+    implements MiniRaftClusterWithGrpc.FactoryGet{
 }
