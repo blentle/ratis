@@ -21,6 +21,7 @@ import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.Option;
 import org.apache.commons.cli.Options;
 import org.apache.ratis.client.RaftClient;
+import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.exceptions.TransferLeadershipException;
@@ -58,12 +59,8 @@ public class TransferCommand extends AbstractRatisCommand {
     super.run(cl);
 
     String strAddr = cl.getOptionValue(ADDRESS_OPTION_NAME);
-    // TODO: Default timeout should be set to 0, which means let server decide (based on election timeout).
-    //       However, occasionally the request could timeout too fast while the transfer is in progress.
-    //       i.e. request timeout doesn't mean transfer leadership has failed.
-    //       Currently, Ratis shell returns merely based on the result of the request.
-    //       So we set a larger default timeout here (3s).
-    final TimeDuration timeoutDefault = TimeDuration.valueOf(3, TimeUnit.SECONDS);
+    // Default timeout is 0, which means let server decide (will use default request timeout).
+    final TimeDuration timeoutDefault = TimeDuration.ZERO;
     // Default timeout for legacy mode matches with the legacy command (version 2.4.x and older).
     final TimeDuration timeoutLegacy = TimeDuration.valueOf(60, TimeUnit.SECONDS);
     final Optional<TimeDuration> timeout = !cl.hasOption(TIMEOUT_OPTION_NAME) ? Optional.empty() :
@@ -114,10 +111,11 @@ public class TransferCommand extends AbstractRatisCommand {
 
   private void setPriority(RaftClient client, RaftPeer target, int priority) throws IOException {
     printf("Changing priority of peer %s with address %s to %d%n", target.getId(), target.getAddress(), priority);
-    List<RaftPeer> peers = getRaftGroup().getPeers().stream()
+    final List<RaftPeer> peers = getPeerStream(RaftPeerRole.FOLLOWER)
         .map(peer -> peer == target ? RaftPeer.newBuilder(peer).setPriority(priority).build() : peer)
         .collect(Collectors.toList());
-    RaftClientReply reply = client.admin().setConfiguration(peers);
+    final List<RaftPeer> listeners = getPeerStream(RaftPeerRole.LISTENER).collect(Collectors.toList());
+    RaftClientReply reply = client.admin().setConfiguration(peers, listeners);
     processReply(reply, () -> "Failed to set master priorities");
   }
 

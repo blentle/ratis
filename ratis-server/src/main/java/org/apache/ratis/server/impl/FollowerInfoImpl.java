@@ -43,11 +43,11 @@ class FollowerInfoImpl implements FollowerInfo {
   private final RaftLogIndex matchIndex = new RaftLogIndex("matchIndex", RaftLog.INVALID_LOG_INDEX);
   private final RaftLogIndex commitIndex = new RaftLogIndex("commitIndex", RaftLog.INVALID_LOG_INDEX);
   private final RaftLogIndex snapshotIndex = new RaftLogIndex("snapshotIndex", 0L);
-  private volatile boolean attendVote;
+  private volatile boolean caughtUp;
   private volatile boolean ackInstallSnapshotAttempt = false;
 
   FollowerInfoImpl(RaftGroupMemberId id, RaftPeer peer, Function<RaftPeerId, RaftPeer> getPeer,
-      Timestamp lastRpcTime, long nextIndex, boolean attendVote) {
+      Timestamp lastRpcTime, long nextIndex, boolean caughtUp) {
     this.name = id + "->" + peer.getId();
     this.infoIndexChange = s -> LOG.info("{}: {}", name, s);
     this.debugIndexChange = s -> LOG.debug("{}: {}", name, s);
@@ -58,7 +58,7 @@ class FollowerInfoImpl implements FollowerInfo {
     this.lastRpcSendTime = new AtomicReference<>(lastRpcTime);
     this.lastHeartbeatSendTime = new AtomicReference<>(lastRpcTime);
     this.nextIndex = new RaftLogIndex("nextIndex", nextIndex);
-    this.attendVote = attendVote;
+    this.caughtUp = caughtUp;
   }
 
   @Override
@@ -98,17 +98,20 @@ class FollowerInfoImpl implements FollowerInfo {
 
   @Override
   public void decreaseNextIndex(long newNextIndex) {
-    nextIndex.updateUnconditionally(old -> old <= 0L? old: Math.min(old - 1, newNextIndex), infoIndexChange);
+    nextIndex.updateUnconditionally(old -> old <= 0L? old: Math.min(old - 1, newNextIndex),
+        message -> infoIndexChange.accept("decreaseNextIndex " + message));
   }
 
   @Override
   public void setNextIndex(long newNextIndex) {
-    nextIndex.updateUnconditionally(old -> newNextIndex >= 0 ? newNextIndex : old, infoIndexChange);
+    nextIndex.updateUnconditionally(old -> newNextIndex >= 0 ? newNextIndex : old,
+        message -> infoIndexChange.accept("setNextIndex " + message));
   }
 
   @Override
   public void updateNextIndex(long newNextIndex) {
-    nextIndex.updateToMax(newNextIndex, infoIndexChange);
+    nextIndex.updateToMax(newNextIndex,
+        message -> infoIndexChange.accept("decreaseNextIndex " + message));
   }
 
   @Override
@@ -137,17 +140,17 @@ class FollowerInfoImpl implements FollowerInfo {
   @Override
   public String toString() {
     return name + "(c" + getCommitIndex() + ",m" + getMatchIndex() + ",n" + getNextIndex()
-        + ", attendVote=" + attendVote +
+        + ", caughtUp=" + caughtUp +
         ", lastRpcSendTime=" + lastRpcSendTime.get().elapsedTimeMs() +
         ", lastRpcResponseTime=" + lastRpcResponseTime.get().elapsedTimeMs() + ")";
   }
 
-  void startAttendVote() {
-    attendVote = true;
+  void catchUp() {
+    caughtUp = true;
   }
 
-  boolean isAttendingVote() {
-    return attendVote;
+  boolean isCaughtUp() {
+    return caughtUp;
   }
 
   @Override
@@ -174,6 +177,11 @@ class FollowerInfoImpl implements FollowerInfo {
   @Override
   public Timestamp getLastRpcResponseTime() {
     return lastRpcResponseTime.get();
+  }
+
+  @Override
+  public Timestamp getLastRpcSendTime() {
+    return lastRpcSendTime.get();
   }
 
   @Override

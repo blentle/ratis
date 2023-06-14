@@ -260,7 +260,6 @@ class ServerState {
       LOG.info("{}: change Leader from {} to {} at term {} for {}{}",
           getMemberId(), oldLeaderId, newLeaderId, getCurrentTerm(), op, suffix);
       if (newLeaderId != null) {
-        server.finishTransferLeadership();
         server.onGroupLeaderElected();
       }
     }
@@ -398,9 +397,11 @@ class ServerState {
     getStateMachineUpdater().notifyUpdater();
   }
 
-  void reloadStateMachine(long lastIndexInSnapshot) {
-    getLog().updateSnapshotIndex(lastIndexInSnapshot);
+  void reloadStateMachine(TermIndex snapshotTermIndex) {
     getStateMachineUpdater().reloadStateMachine();
+
+    getLog().onSnapshotInstalled(snapshotTermIndex.getIndex());
+    latestInstalledSnapshot.set(snapshotTermIndex);
   }
 
   void close() {
@@ -442,12 +443,6 @@ class ServerState {
     StateMachine sm = server.getStateMachine();
     sm.pause(); // pause the SM to prepare for install snapshot
     snapshotManager.installSnapshot(request, sm);
-    updateInstalledSnapshotIndex(TermIndex.valueOf(request.getSnapshotChunk().getTermIndex()));
-  }
-
-  void updateInstalledSnapshotIndex(TermIndex lastTermIndexInSnapshot) {
-    getLog().onSnapshotInstalled(lastTermIndexInSnapshot.getIndex());
-    latestInstalledSnapshot.set(lastTermIndexInSnapshot);
   }
 
   private SnapshotInfo getLatestSnapshot() {

@@ -225,7 +225,7 @@ class RaftServerImpl implements RaftServer.Division,
         .setProperties(getRaftServer().getProperties())
         .build());
 
-    this.transferLeadership = new TransferLeadership(this);
+    this.transferLeadership = new TransferLeadership(this, properties);
     this.snapshotRequestHandler = new SnapshotManagementRequestHandler(this);
     this.snapshotInstallationHandler = new SnapshotInstallationHandler(this, properties);
 
@@ -545,6 +545,7 @@ class RaftServerImpl implements RaftServer.Division,
         role.shutdownFollowerState();
       }
       role.startFollowerState(this, reason);
+      firstElectionSinceStartup.set(false);
     }
     return metadataUpdated;
   }
@@ -580,7 +581,10 @@ class RaftServerImpl implements RaftServer.Division,
       role.getLeaderState().ifPresent(
           leader -> leader.updateFollowerCommitInfos(commitInfoCache, infos));
     } else {
-      getRaftConf().getAllPeers().stream()
+      RaftConfigurationImpl raftConf = getRaftConf();
+      Stream.concat(
+              raftConf.getAllPeers(RaftPeerRole.FOLLOWER).stream(),
+              raftConf.getAllPeers(RaftPeerRole.LISTENER).stream())
           .map(RaftPeer::getId)
           .filter(id -> !id.equals(getId()))
           .map(commitInfoCache::get)
@@ -592,7 +596,10 @@ class RaftServerImpl implements RaftServer.Division,
 
   GroupInfoReply getGroupInfo(GroupInfoRequest request) {
     final RaftStorageDirectory dir = state.getStorage().getStorageDir();
-    return new GroupInfoReply(request, getCommitInfos(), getGroup(), getRoleInfoProto(), dir.isHealthy());
+    final RaftConfigurationProto conf =
+        LogProtoUtils.toRaftConfigurationProtoBuilder(getRaftConf()).build();
+    return new GroupInfoReply(request, getCommitInfos(), getGroup(), getRoleInfoProto(),
+        dir.isHealthy(), conf);
   }
 
   RoleInfoProto getRoleInfoProto() {
@@ -891,9 +898,7 @@ class RaftServerImpl implements RaftServer.Division,
 
     final RaftClientRequest.Type type = request.getType();
     replyFuture.whenComplete((clientReply, exception) -> {
-      if (clientReply.isSuccess()) {
-        timerContext.ifPresent(Timekeeper.Context::stop);
-      }
+      timerContext.ifPresent(Timekeeper.Context::stop);
       if (exception != null || clientReply.getException() != null) {
         raftServerMetrics.incFailedRequestCount(type);
       }
@@ -1072,10 +1077,6 @@ class RaftServerImpl implements RaftServer.Division,
 
   boolean isSteppingDown() {
     return transferLeadership.isSteppingDown();
-  }
-
-  void finishTransferLeadership() {
-    transferLeadership.finish(state.getLeaderId(), false);
   }
 
   CompletableFuture<RaftClientReply> transferLeadershipAsync(TransferLeadershipRequest request)
@@ -1461,6 +1462,10 @@ class RaftServerImpl implements RaftServer.Division,
 
   private CommitInfoProto updateCommitInfoCache() {
     return commitInfoCache.update(getPeer(), state.getLog().getLastCommittedIndex());
+  }
+
+  ExecutorService getServerExecutor() {
+    return serverExecutor;
   }
 
   @SuppressWarnings("checkstyle:parameternumber")
@@ -1851,6 +1856,6 @@ class RaftServerImpl implements RaftServer.Division,
   }
 
   void onGroupLeaderElected() {
-    this.firstElectionSinceStartup.set(false);
+    transferLeadership.complete(TransferLeadership.Result.SUCCESS);
   }
 }

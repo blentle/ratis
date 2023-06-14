@@ -26,8 +26,6 @@ import org.apache.ratis.proto.RaftProtos.LogEntryProto.LogEntryBodyCase;
 import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
 import org.apache.ratis.proto.RaftProtos.ReplicationLevel;
 import org.apache.ratis.proto.RaftProtos.RoleInfoProto;
-import org.apache.ratis.proto.RaftProtos.StartLeaderElectionReplyProto;
-import org.apache.ratis.proto.RaftProtos.StartLeaderElectionRequestProto;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftClientRequest;
@@ -62,6 +60,7 @@ import org.apache.ratis.util.TimeDuration;
 import org.apache.ratis.util.Timestamp;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -365,7 +364,7 @@ class LeaderStateImpl implements LeaderState {
 
     final Collection<RaftPeer> listeners = conf.getAllPeers(RaftPeerRole.LISTENER);
     if (!listeners.isEmpty()) {
-      addSenders(listeners, placeHolderIndex, false);
+      addSenders(listeners, placeHolderIndex, true);
     }
   }
 
@@ -424,9 +423,13 @@ class LeaderStateImpl implements LeaderState {
     return currentTerm;
   }
 
+  TermIndex getLastEntry() {
+    return server.getState().getLastEntry();
+  }
+
   @Override
   public boolean onFollowerTerm(FollowerInfo follower, long followerTerm) {
-    if (isAttendingVote(follower) && followerTerm > getCurrentTerm()) {
+    if (isCaughtUp(follower) && followerTerm > getCurrentTerm()) {
       submitStepDownEvent(followerTerm, StepDownReason.HIGHER_TERM);
       return true;
     }
@@ -558,7 +561,7 @@ class LeaderStateImpl implements LeaderState {
   @Override
   public AppendEntriesRequestProto newAppendEntriesRequestProto(FollowerInfo follower,
       List<LogEntryProto> entries, TermIndex previous, long callId) {
-    final boolean initializing = isAttendingVote(follower);
+    final boolean initializing = isCaughtUp(follower);
     final RaftPeerId targetId = follower.getId();
     return ServerProtoUtils.toAppendEntriesRequestProto(server.getMemberId(), targetId, currentTerm, entries,
         ServerImplUtils.effectiveCommitIndex(raftLog.getLastCommittedIndex(), previous, entries.size()),
@@ -578,10 +581,10 @@ class LeaderStateImpl implements LeaderState {
     return server.getRaftConf().getPeer(id, RaftPeerRole.FOLLOWER, RaftPeerRole.LISTENER);
   }
 
-  private Collection<LogAppender> addSenders(Collection<RaftPeer> newPeers, long nextIndex, boolean attendVote) {
+  private Collection<LogAppender> addSenders(Collection<RaftPeer> newPeers, long nextIndex, boolean caughtUp) {
     final Timestamp t = Timestamp.currentTime().addTimeMs(-server.getMaxTimeoutMs());
     final List<LogAppender> newAppenders = newPeers.stream().map(peer -> {
-      final FollowerInfo f = new FollowerInfoImpl(server.getMemberId(), peer, this::getPeer, t, nextIndex, attendVote);
+      final FollowerInfo f = new FollowerInfoImpl(server.getMemberId(), peer, this::getPeer, t, nextIndex, caughtUp);
       followerInfoMap.put(peer.getId(), f);
       raftServerMetrics.addFollower(peer.getId());
       logAppenderMetrics.addFollowerGauges(peer.getId(), f::getNextIndex, f::getMatchIndex, f::getLastRpcTime);
@@ -658,46 +661,14 @@ class LeaderStateImpl implements LeaderState {
     return pendingStepDown.submitAsync(request);
   }
 
-  private synchronized void sendStartLeaderElection(RaftPeerId follower, TermIndex lastEntry) {
-    ServerState state = server.getState();
-    TermIndex currLastEntry = state.getLastEntry();
-    if (ServerState.compareLog(currLastEntry, lastEntry) != 0) {
-      LOG.warn("{} can not send StartLeaderElectionRequest to follower:{} because currLastEntry:{} " +
-              "did not match lastEntry:{}", this, follower, currLastEntry, lastEntry);
-      return;
-    }
-    LOG.info("{}: send StartLeaderElectionRequest to follower {} on term {}, lastEntry={}",
-        this, follower, currentTerm, lastEntry);
-
-    final StartLeaderElectionRequestProto r = ServerProtoUtils.toStartLeaderElectionRequestProto(
-        server.getMemberId(), follower, lastEntry);
-    CompletableFuture.supplyAsync(() -> {
-      server.getLeaderElectionMetrics().onTransferLeadership();
-      try {
-        StartLeaderElectionReplyProto replyProto = server.getServerRpc().startLeaderElection(r);
-        LOG.info("{} received {} reply of StartLeaderElectionRequest from follower:{}",
-            this, replyProto.getServerReply().getSuccess() ? "success" : "fail", follower);
-      } catch (IOException e) {
-        LOG.warn("{} send StartLeaderElectionRequest throw exception", this, e);
+  private static LogAppender chooseUpToDateFollower(List<LogAppender> followers, TermIndex leaderLastEntry) {
+    for(LogAppender f : followers) {
+      if (TransferLeadership.isFollowerUpToDate(f.getFollower(), leaderLastEntry)
+          == TransferLeadership.Result.SUCCESS) {
+        return f;
       }
-      return null;
-    });
-  }
-
-  boolean sendStartLeaderElection(FollowerInfo followerInfo) {
-    final RaftPeerId followerId = followerInfo.getId();
-    final TermIndex leaderLastEntry = server.getState().getLastEntry();
-    if (leaderLastEntry == null) {
-      sendStartLeaderElection(followerId, null);
-      return true;
     }
-
-    final long followerMatchIndex = followerInfo.getMatchIndex();
-    if (followerMatchIndex >= leaderLastEntry.getIndex()) {
-      sendStartLeaderElection(followerId, leaderLastEntry);
-      return true;
-    }
-    return false;
+    return null;
   }
 
   private void prepare() {
@@ -755,7 +726,7 @@ class LeaderStateImpl implements LeaderState {
    * 3. Otherwise the peer is making progressing. Keep waiting.
    */
   private BootStrapProgress checkProgress(FollowerInfo follower, long committed) {
-    Preconditions.assertTrue(!isAttendingVote(follower));
+    Preconditions.assertTrue(!isCaughtUp(follower));
     final Timestamp progressTime = Timestamp.currentTime().addTimeMs(-server.getMaxTimeoutMs());
     final Timestamp timeoutTime = Timestamp.currentTime().addTimeMs(-3L * server.getMaxTimeoutMs());
     if (follower.getLastRpcResponseTime().compareTo(timeoutTime) < 0) {
@@ -773,12 +744,12 @@ class LeaderStateImpl implements LeaderState {
 
   @Override
   public void onFollowerSuccessAppendEntries(FollowerInfo follower) {
-    if (isAttendingVote(follower)) {
+    if (isCaughtUp(follower)) {
       submitUpdateCommitEvent();
     } else {
       eventQueue.submit(checkStagingEvent);
     }
-    server.getTransferLeadership().onFollowerAppendEntriesReply(this, follower);
+    server.getTransferLeadership().onFollowerAppendEntriesReply(follower);
   }
 
   @Override
@@ -795,7 +766,7 @@ class LeaderStateImpl implements LeaderState {
       // check progress for the new followers
       final EnumSet<BootStrapProgress> reports = getLogAppenders()
           .map(LogAppender::getFollower)
-          .filter(follower -> !isAttendingVote(follower))
+          .filter(follower -> !isCaughtUp(follower))
           .map(follower -> checkProgress(follower, commitIndex))
           .collect(Collectors.toCollection(() -> EnumSet.noneOf(BootStrapProgress.class)));
       if (reports.contains(BootStrapProgress.NOPROGRESS)) {
@@ -807,7 +778,7 @@ class LeaderStateImpl implements LeaderState {
             .map(LogAppender::getFollower)
             .filter(f -> server.getRaftConf().containsInConf(f.getId()))
             .map(FollowerInfoImpl.class::cast)
-            .forEach(FollowerInfoImpl::startAttendVote);
+            .forEach(FollowerInfoImpl::catchUp);
       }
     }
   }
@@ -1044,7 +1015,7 @@ class LeaderStateImpl implements LeaderState {
     }
     final int leaderPriority = leader.getPriority();
 
-    FollowerInfo highestPriorityInfo = null;
+    final List<LogAppender> highestPriorityInfos = new ArrayList<>();
     int highestPriority = Integer.MIN_VALUE;
     for (LogAppender logAppender : senders) {
       final RaftPeer follower = conf.getPeer(logAppender.getFollowerId());
@@ -1053,12 +1024,17 @@ class LeaderStateImpl implements LeaderState {
       }
       final int followerPriority = follower.getPriority();
       if (followerPriority > leaderPriority && followerPriority >= highestPriority) {
-        highestPriority = followerPriority;
-        highestPriorityInfo = logAppender.getFollower();
+        if (followerPriority > highestPriority) {
+          highestPriority = followerPriority;
+          highestPriorityInfos.clear();
+        }
+        highestPriorityInfos.add(logAppender);
       }
     }
-    if (highestPriorityInfo != null) {
-      sendStartLeaderElection(highestPriorityInfo);
+    final TermIndex leaderLastEntry = getLastEntry();
+    final LogAppender appender = chooseUpToDateFollower(highestPriorityInfos, leaderLastEntry);
+    if (appender != null) {
+      server.getTransferLeadership().start(appender);
     }
   }
 
@@ -1140,13 +1116,7 @@ class LeaderStateImpl implements LeaderState {
     }
 
     if (supplier.isInitialized()) {
-      senders.forEach(sender -> {
-        try {
-          sender.triggerHeartbeat();
-        } catch (IOException e) {
-          LOG.warn("{}: {} cannot trigger heartbeat due to {}", this, sender, e);
-        }
-      });
+      senders.forEach(LogAppender::triggerHeartbeat);
     }
 
     return listener.getFuture();
@@ -1214,7 +1184,7 @@ class LeaderStateImpl implements LeaderState {
     void fail(BootStrapProgress progress) {
       final String message = this + ": Fail to set configuration " + newConf + " due to " + progress;
       LOG.debug(message);
-      stopAndRemoveSenders(s -> !isAttendingVote(s.getFollower()));
+      stopAndRemoveSenders(s -> !isCaughtUp(s.getFollower()));
 
       stagingState = null;
       // send back failure response to client's request
@@ -1244,8 +1214,8 @@ class LeaderStateImpl implements LeaderState {
     return getLogAppenders().filter(a -> a.getFollowerId().equals(id)).findAny();
   }
 
-  private static boolean isAttendingVote(FollowerInfo follower) {
-    return ((FollowerInfoImpl)follower).isAttendingVote();
+  private static boolean isCaughtUp(FollowerInfo follower) {
+    return ((FollowerInfoImpl)follower).isCaughtUp();
   }
 
   @Override
